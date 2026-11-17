@@ -1,0 +1,62 @@
+minimum_pre_commit_version: "3.2.0"
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        args: [--markdown-linebreak-ext=md]
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-case-conflict
+      - id: check-added-large-files
+      - id: detect-private-key
+
+  - repo: local
+    hooks:
+      - id: adr-number-unique
+        name: ADR numeric prefixes are unique
+        language: system
+        entry: >-
+          bash -c 'set -euo pipefail;
+          dups=$(ls docs/adr | sed -n "s/^\([0-9]\{4\}\)-.*/\1/p" | sort | uniq -d);
+          if [ -n "$dups" ]; then
+          printf "Duplicate ADR numeric prefixes:\n%s\n" "$dups";
+          exit 1;
+          fi'
+        files: ^docs/adr/[0-9].*\.md$
+        pass_filenames: false
+
+      - id: ferry-gofmt
+        name: gofmt check
+        language: system
+        entry: >-
+          bash -c 'unformatted="$(gofmt -l "$@")";
+          if [ -n "$unformatted" ]; then
+          printf "Files need gofmt:\n%s\n" "$unformatted";
+          exit 1;
+          fi' --
+        types: [go]
+
+      - id: ferry-golangci-lint
+        name: golangci-lint check
+        language: system
+        entry: >-
+          bash -c 'if git rev-parse --verify HEAD >/dev/null 2>&1; then
+          golangci-lint run --new-from-rev HEAD --whole-files;
+          else
+          golangci-lint run ./...;
+          fi'
+        types: [go]
+        pass_filenames: false
+        require_serial: true
+
+      - id: ferry-go-test
+        name: go short unit tests
+        language: system
+        entry: go test -short ./...
+        types: [go]
+        pass_filenames: false
+        require_serial: true
