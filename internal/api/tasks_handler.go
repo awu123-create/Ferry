@@ -225,35 +225,36 @@ func resolveIdempotencyKey(headerVal, bodyVal string) (string, error) {
 	return "", domain.NewValidationError("idempotency_key", "must be provided via Idempotency-Key header or body")
 }
 
-// createTask orchestrates idempotent Task + Outbox creation.
+// createTask 编排幂等 Task 与 Outbox 记录的原子创建流程。
 //
-// Contract (Milestone 1 - core logic to be implemented):
-//  1. Load Endpoint via h.endpoints.GetEndpoint(ctx, input.EndpointID).
-//  2. Construct domain Task & OutboxItem via domain.NewTask(domain.NewTaskParams{
-//     Endpoint:      ep,
+// 契约要求（Milestone 1 核心逻辑，留待实现）：
+//  1. 调用 h.endpoints.GetEndpoint(ctx, input.EndpointID) 加载目标 Endpoint。
+//  2. 调用 domain.NewTask 构造领域对象 Task 与 OutboxItem：
+//     domain.NewTask(domain.NewTaskParams{
+//     Endpoint:       ep,
 //     IdempotencyKey: input.IdempotencyKey,
-//     RawPayload:    input.RawPayload,
-//     Headers:       input.Headers,
-//     DeliverAt:     input.DeliverAt,
-//     MaxAttempts:   input.MaxAttempts,
-//     DeadlineAt:    input.DeadlineAt,
-//     DefaultWindow: h.cfg.DefaultTaskWindow,
-//     Now:           time.Now().UTC(),
-//     }).
-//  3. Persist atomically via h.tasks.CreateTaskIdempotent(ctx, task, outbox) and return the result.
+//     RawPayload:     input.RawPayload,
+//     Headers:        input.Headers,
+//     DeliverAt:      input.DeliverAt,
+//     MaxAttempts:    input.MaxAttempts,
+//     DeadlineAt:     input.DeadlineAt,
+//     DefaultWindow:  h.cfg.DefaultTaskWindow,
+//     Now:            time.Now().UTC(),
+//     })
+//  3. 调用 h.tasks.CreateTaskIdempotent(ctx, task, outbox) 原子落盘并返回结果。
 func (h *Handler) createTask(ctx context.Context, input createTaskInput) (domain.CreateTaskResult, error) {
 	_ = ctx
 	_ = input
 	return domain.CreateTaskResult{}, domain.ErrNotImplemented
 }
 
-// cancelTask acquires the Execution Lock before cancelling an active Task in PostgreSQL.
+// cancelTask 先抢占 Execution Lock，再在 PostgreSQL 中原子取消处于非终态的 Task。
 //
-// Contract (Milestone 1 - core logic to be implemented, ADR-0008 §3):
-//  1. Acquire lock via token, acquired, err := h.locker.AcquireExecutionLock(ctx, taskID, h.cfg.CancelLockTTL).
-//  2. If !acquired: return domain.Task{}, domain.ErrTaskExecutionInFlight (409 Conflict).
-//  3. Defer h.locker.ReleaseExecutionLock(context.WithoutCancel(ctx), taskID, token).
-//  4. Execute h.tasks.CancelTask(ctx, taskID, time.Now().UTC()) and return the cancelled Task.
+// 契约要求（Milestone 1 核心逻辑，留待实现，见 ADR-0008 §3）：
+//  1. 通过 token, acquired, err := h.locker.AcquireExecutionLock(ctx, taskID, h.cfg.CancelLockTTL) 抢占执行锁。
+//  2. 若 !acquired：说明 Worker 正在执行投递，返回 domain.Task{}, domain.ErrTaskExecutionInFlight（409 Conflict）。
+//  3. 在 defer 中调用 h.locker.ReleaseExecutionLock(context.WithoutCancel(ctx), taskID, token) 验主释放锁。
+//  4. 调用 h.tasks.CancelTask(ctx, taskID, time.Now().UTC()) 并返回取消后的 Task。
 func (h *Handler) cancelTask(ctx context.Context, taskID uuid.UUID) (domain.Task, error) {
 	if h.locker == nil {
 		return domain.Task{}, domain.ErrNotImplemented

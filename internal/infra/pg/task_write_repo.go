@@ -9,23 +9,23 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// CreateTaskIdempotent persists a new Task and its OutboxItem in one PostgreSQL transaction,
-// or detects an existing record on (endpoint_id, idempotency_key) and validates payload SHA-256.
+// CreateTaskIdempotent 在单次 PostgreSQL 事务中原子写入新 Task 与 OutboxItem；
+// 若命中 (endpoint_id, idempotency_key) 唯一约束冲突，则回查已有记录并校验载荷 SHA-256。
 //
-// Implementation notes (Milestone 1 - core logic to be implemented):
-//  1. Open a single transaction via s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { ... }).
-//  2. Convert task to toTaskPO(task) and insert with:
+// 实现指引（Milestone 1 核心逻辑，留待实现）：
+//  1. 通过 s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error { ... }) 开启单次事务。
+//  2. 使用 toTaskPO(task) 转换后执行冲突忽略插入：
 //     tx.Clauses(clause.OnConflict{
 //     Columns:   []clause.Column{{Name: "endpoint_id"}, {Name: "idempotency_key"}},
 //     DoNothing: true,
 //     }).Create(&po)
-//  3. If res.RowsAffected == 1:
-//     Convert outbox via toOutboxPO(outbox), insert into outbox (DB trigger notifies ferry_outbox),
-//     and return CreateTaskResult{Task: task, Created: true}.
-//  4. If res.RowsAffected == 0:
-//     Query the existing taskPO by (endpoint_id, idempotency_key), convert via toDomainTask,
-//     call existing.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256),
-//     and return CreateTaskResult{Task: existing, Created: false} on match (or ErrIdempotencyConflict).
+//  3. 若 res.RowsAffected == 1：
+//     通过 toOutboxPO(outbox) 转换并写入 outbox（数据库触发器会自动通知 ferry_outbox），
+//     返回 CreateTaskResult{Task: task, Created: true}。
+//  4. 若 res.RowsAffected == 0：
+//     按 (endpoint_id, idempotency_key) 查询已有 taskPO 并转为领域模型，
+//     调用 existing.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256)，
+//     一致则返回 CreateTaskResult{Task: existing, Created: false}，不一致返回 ErrIdempotencyConflict。
 func (s *Store) CreateTaskIdempotent(ctx context.Context, task domain.Task, outbox domain.OutboxItem) (domain.CreateTaskResult, error) {
 	_ = ctx
 	_ = task
@@ -33,14 +33,14 @@ func (s *Store) CreateTaskIdempotent(ctx context.Context, task domain.Task, outb
 	return domain.CreateTaskResult{}, domain.ErrNotImplemented
 }
 
-// SavePreDeliveryDeadLetter atomically transitions a Task to DEAD_LETTER before any HTTP call
-// using the composite optimistic guard (replay_count, attempt, status IN ('PENDING', 'RETRYING')).
+// SavePreDeliveryDeadLetter 在未发起任何 HTTP 请求前，使用复合乐观锁条件
+// (replay_count, attempt, status IN ('PENDING', 'RETRYING')) 原子迁移任务至 DEAD_LETTER。
 //
-// Implementation notes (Milestone 1 - core logic to be implemented):
-//   - Execute conditional Update on taskPO where:
-//     id = ? AND replay_count = ? AND attempt = ? AND status IN ('PENDING', 'RETRYING')
-//   - Set status = DEAD_LETTER, last_error = reason, completed_at = now, updated_at = now.
-//   - Return (res.RowsAffected == 1, res.Error).
+// 实现指引（Milestone 1 核心逻辑，留待实现）：
+//   - 对 taskPO 执行条件更新：
+//     WHERE id = ? AND replay_count = ? AND attempt = ? AND status IN ('PENDING', 'RETRYING')
+//   - 更新 status = DEAD_LETTER、last_error = reason、completed_at = now、updated_at = now。
+//   - 返回 (res.RowsAffected == 1, res.Error)。
 func (s *Store) SavePreDeliveryDeadLetter(
 	ctx context.Context,
 	taskID uuid.UUID,
@@ -57,17 +57,17 @@ func (s *Store) SavePreDeliveryDeadLetter(
 	return false, domain.ErrNotImplemented
 }
 
-// SaveDeliveryOutcome appends the DeliveryAttempt audit row and conditionally transitions the Task
-// inside a single PostgreSQL transaction (ADR-0007 & ADR-0008).
+// SaveDeliveryOutcome 在单次 PostgreSQL 事务中追加 DeliveryAttempt 审计流水，
+// 并按复合乐观锁条件迁移 Task 状态（ADR-0007 & ADR-0008）。
 //
-// Implementation notes (Milestone 1 - core logic to be implemented):
-//  1. Open a single transaction via s.db.WithContext(ctx).Transaction(...) (keep it concise and fast).
-//  2. Always insert toDeliveryAttemptPO(attempt) into task_attempts so real outbound HTTP calls
-//     remain auditable even if a concurrent Cancel won the race under extreme lock expiry.
-//  3. Execute conditional CAS Update on taskPO:
+// 实现指引（Milestone 1 核心逻辑，留待实现）：
+//  1. 通过 s.db.WithContext(ctx).Transaction(...) 开启短事务。
+//  2. 始终插入 toDeliveryAttemptPO(attempt) 到 task_attempts 表，确保即使极端锁过期与取消并发重叠，
+//     实际发出的 HTTP 请求依然保留完整审计轨迹。
+//  3. 对 taskPO 执行复合乐观锁 CAS 更新：
 //     WHERE id = ? AND replay_count = ? AND attempt = ? AND status IN ('PENDING', 'RETRYING')
-//     updating status, attempt, next_run_at, last_error, completed_at, updated_at.
-//  4. Return (res.RowsAffected == 1, nil).
+//     更新 status、attempt、next_run_at、last_error、completed_at、updated_at。
+//  4. 返回 (res.RowsAffected == 1, nil)。
 func (s *Store) SaveDeliveryOutcome(
 	ctx context.Context,
 	expectedReplayCount, expectedAttempt int,
@@ -82,15 +82,15 @@ func (s *Store) SaveDeliveryOutcome(
 	return false, domain.ErrNotImplemented
 }
 
-// CancelTask atomically moves an active Task (PENDING or RETRYING) to CANCELLED while the caller
-// already holds the Redis Execution Lock (ADR-0007 & ADR-0008).
+// CancelTask 在调用方已持有 Redis Execution Lock 的前提下，
+// 原子将非终态（PENDING 或 RETRYING）的 Task 迁移为 CANCELLED（ADR-0007 & ADR-0008）。
 //
-// Implementation notes (Milestone 1 - core logic to be implemented):
-//  1. Run conditional Update on taskPO where id = ? AND status IN ('PENDING', 'RETRYING')
-//     setting status = CANCELLED, completed_at = now, updated_at = now.
-//  2. If res.RowsAffected == 1, load and return the updated Task via s.GetTask(ctx, taskID).
-//  3. If res.RowsAffected == 0, call s.GetTask(ctx, taskID): return ErrTaskNotFound if missing,
-//     or ErrTaskNotCancellable if already in a terminal state.
+// 实现指引（Milestone 1 核心逻辑，留待实现）：
+//  1. 对 taskPO 执行条件更新：WHERE id = ? AND status IN ('PENDING', 'RETRYING')，
+//     设置 status = CANCELLED、completed_at = now、updated_at = now。
+//  2. 若 res.RowsAffected == 1，调用 s.GetTask(ctx, taskID) 并返回更新后的 Task。
+//  3. 若 res.RowsAffected == 0，调用 s.GetTask(ctx, taskID)：不存在则返回 ErrTaskNotFound，
+//     已处于终态则返回 ErrTaskNotCancellable。
 func (s *Store) CancelTask(ctx context.Context, taskID uuid.UUID, now time.Time) (domain.Task, error) {
 	_ = ctx
 	_ = taskID

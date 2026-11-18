@@ -14,13 +14,13 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// ReadyReader pulls Task tickets from Kafka and commits only contiguous completed partition watermarks.
+// ReadyReader 从 Kafka 拉取待投递 Task 票据，并仅按分区连续完成水位提交 Offset。
 type ReadyReader struct {
 	client  *kgo.Client
 	tracker *offsetTracker
 }
 
-// NewReadyReader constructs a Kafka group reader with manual contiguous watermark commits.
+// NewReadyReader 构造禁用自动提交、按连续完成水位手动提交的 Kafka 消费组读取器。
 func NewReadyReader(brokers []string, topic, groupID string) (*ReadyReader, error) {
 	if len(brokers) == 0 {
 		return nil, fmt.Errorf("kafka reader requires at least one broker")
@@ -54,7 +54,7 @@ func NewReadyReader(brokers []string, topic, groupID string) (*ReadyReader, erro
 	return reader, nil
 }
 
-// PollReady fetches up to maxRecords tickets from Kafka and registers their offsets in the watermark tracker.
+// PollReady 从 Kafka 拉取最多 maxRecords 条票据，并将其偏移量登记到水位追踪器中。
 func (r *ReadyReader) PollReady(ctx context.Context, maxRecords int) ([]domain.ReadyTicket, error) {
 	if maxRecords <= 0 {
 		maxRecords = 1
@@ -98,12 +98,12 @@ func (r *ReadyReader) PollReady(ctx context.Context, maxRecords int) ([]domain.R
 	return tickets, nil
 }
 
-// Ack marks a ticket as finished so its partition watermark can advance once earlier offsets complete.
+// Ack 将指定票据标记为已完成；当同分区更早偏移量也全部完成后，提交水位随之推进。
 func (r *ReadyReader) Ack(ticket domain.ReadyTicket) {
 	r.tracker.markDone(ticket)
 }
 
-// CommitCompleted synchronously commits all contiguous completed offsets across assigned partitions.
+// CommitCompleted 同步提交所有已分配分区上连续完成的 Offset 水位。
 func (r *ReadyReader) CommitCompleted(ctx context.Context) error {
 	offsets := r.tracker.takeCommittable()
 	if len(offsets) == 0 {
@@ -116,12 +116,12 @@ func (r *ReadyReader) CommitCompleted(ctx context.Context) error {
 	return nil
 }
 
-// Ping verifies broker connectivity within ctx.
+// Ping 在 ctx 超时范围内校验 Kafka Broker 连通性。
 func (r *ReadyReader) Ping(ctx context.Context) error {
 	return r.client.Ping(ctx)
 }
 
-// Close closes the underlying Kafka client.
+// Close 关闭底层 Kafka 客户端连接。
 func (r *ReadyReader) Close() {
 	if r != nil && r.client != nil {
 		r.client.Close()
@@ -210,7 +210,7 @@ func (t *offsetTracker) recordPolled(tickets []domain.ReadyTicket) {
 		tp := topicPartition{topic: ticket.Topic, partition: ticket.Partition}
 		queue := t.inFlight[tp]
 		if n := len(queue); n > 0 && ticket.Offset <= queue[n-1].offset {
-			// Partition may have been re-polled from an earlier uncommitted offset after rebalance.
+			// 发生重平衡后，该分区可能从更早的未提交偏移量重新拉取，此处清理重叠或后续残留条目。
 			filtered := queue[:0]
 			for _, item := range queue {
 				if item.offset < ticket.Offset {

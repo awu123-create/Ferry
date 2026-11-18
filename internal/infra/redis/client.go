@@ -8,12 +8,12 @@ import (
 	goredis "github.com/redis/go-redis/v9"
 )
 
-// Client wraps go-redis/v9 lifecycle and exposes the client for Redis adapters.
+// Client 封装 go-redis/v9 连接生命周期，并向上层适配器暴露客户端实例。
 type Client struct {
 	rdb *goredis.Client
 }
 
-// New connects to Redis and verifies availability with a PING command.
+// New 连接 Redis 并执行 PING 验证可用性。
 func New(ctx context.Context, addr, password string, db int) (*Client, error) {
 	if strings.TrimSpace(addr) == "" {
 		return nil, fmt.Errorf("redis address must not be empty")
@@ -31,17 +31,17 @@ func New(ctx context.Context, addr, password string, db int) (*Client, error) {
 	return &Client{rdb: rdb}, nil
 }
 
-// Ping verifies Redis readiness within ctx.
+// Ping 在 ctx 超时范围内校验 Redis 可用性。
 func (c *Client) Ping(ctx context.Context) error {
 	return c.rdb.Ping(ctx).Err()
 }
 
-// Raw returns the underlying go-redis client for Milestone 2/3 Lua adapters.
+// Raw 返回底层 go-redis 客户端，供 Milestone 2/3 Lua 脚本适配器使用。
 func (c *Client) Raw() *goredis.Client {
 	return c.rdb
 }
 
-// Close closes the underlying Redis connection pool.
+// Close 关闭底层 Redis 连接池。
 func (c *Client) Close() error {
 	if c == nil || c.rdb == nil {
 		return nil

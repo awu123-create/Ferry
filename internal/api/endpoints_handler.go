@@ -166,7 +166,7 @@ func decodeJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst 
 	if err := dec.Decode(dst); err != nil {
 		return err
 	}
-	// Reject trailing garbage after the root JSON object.
+	// 拒绝根 JSON 对象之后多余的尾随内容。
 	if err := dec.Decode(&struct{}{}); err != io.EOF {
 		return http.ErrBodyNotAllowed
 	}

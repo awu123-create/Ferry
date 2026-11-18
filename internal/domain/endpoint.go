@@ -24,7 +24,7 @@ const (
 	signaturePrefix         = "sha256="
 )
 
-// Endpoint is the aggregate root owning an HTTP delivery address and governance contract.
+// Endpoint 是托管下游 HTTP 接收地址及其投递治理契约的聚合根。
 type Endpoint struct {
 	ID               uuid.UUID
 	Name             string
@@ -39,7 +39,7 @@ type Endpoint struct {
 	UpdatedAt        time.Time
 }
 
-// NewEndpointParams carries validated inputs or defaults for constructing an Endpoint.
+// NewEndpointParams 承载构造 Endpoint 所需的校验后参数或默认值。
 type NewEndpointParams struct {
 	Name             string
 	TargetURL        string
@@ -51,7 +51,7 @@ type NewEndpointParams struct {
 	Enabled          *bool
 }
 
-// UpdateEndpointParams carries optional field mutations for an existing Endpoint.
+// UpdateEndpointParams 承载对现有 Endpoint 的可选字段局部更新参数。
 type UpdateEndpointParams struct {
 	Name             *string
 	TargetURL        *string
@@ -63,7 +63,7 @@ type UpdateEndpointParams struct {
 	Enabled          *bool
 }
 
-// NewEndpoint creates an Endpoint aggregate while enforcing all domain invariants.
+// NewEndpoint 创建 Endpoint 聚合根并校验全部领域不变量。
 func NewEndpoint(params NewEndpointParams, now time.Time) (Endpoint, error) {
 	name := strings.TrimSpace(params.Name)
 	if name == "" {
@@ -132,7 +132,7 @@ func NewEndpoint(params NewEndpointParams, now time.Time) (Endpoint, error) {
 	}, nil
 }
 
-// ApplyUpdate validates and atomically applies partial updates onto the Endpoint.
+// ApplyUpdate 先校验所有待修改字段，再原子性地应用到 Endpoint 上。
 func (e *Endpoint) ApplyUpdate(params UpdateEndpointParams, now time.Time) error {
 	next := *e
 
@@ -186,13 +186,13 @@ func (e *Endpoint) ApplyUpdate(params UpdateEndpointParams, now time.Time) error
 	return nil
 }
 
-// SignPayload generates the Payload Signature header ("sha256=<hex>") over "<ts>.<rawPayload>".
-// It returns an empty string when no signing secret is configured.
+// SignPayload 基于 "<ts>.<rawPayload>" 生成载荷签名头（"sha256=<hex>"）。
+// 未配置签名密钥时返回空字符串。
 func (e Endpoint) SignPayload(timestampUnix int64, rawPayload []byte) string {
 	return signWithSecret(e.SigningSecret, timestampUnix, rawPayload)
 }
 
-// VerifyPayloadSignature verifies an incoming X-Ferry-Signature header in constant time.
+// VerifyPayloadSignature 以常量时间比对校验传入的 X-Ferry-Signature 请求头是否合法。
 func VerifyPayloadSignature(secret, signatureHeader string, timestampUnix int64, rawPayload []byte) bool {
 	if secret == "" {
 		return false

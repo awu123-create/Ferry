@@ -14,7 +14,7 @@ import (
 
 type taskIDContextKey struct{}
 
-// New builds a sampled JSON logger writing to stdout.
+// New 构建输出到标准输出、带采样限流的 JSON 日志记录器。
 func New(level string) (*zap.Logger, error) {
 	parsedLevel, err := parseLevel(level)
 	if err != nil {
@@ -51,12 +51,12 @@ func parseLevel(level string) (zapcore.Level, error) {
 	return lvl, nil
 }
 
-// WithTaskID attaches a task identifier to ctx for downstream SQL and boundary logs.
+// WithTaskID 将任务 ID 绑定到 ctx，供下游 SQL 日志与边界日志透传。
 func WithTaskID(ctx context.Context, taskID uuid.UUID) context.Context {
 	return context.WithValue(ctx, taskIDContextKey{}, taskID)
 }
 
-// TaskIDFromContext retrieves an attached task identifier from ctx if present.
+// TaskIDFromContext 从 ctx 中读取已绑定的任务 ID（如存在）。
 func TaskIDFromContext(ctx context.Context) (uuid.UUID, bool) {
 	if ctx == nil {
 		return uuid.Nil, false

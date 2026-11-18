@@ -14,13 +14,13 @@ import (
 	"github.com/awu123-create/ferry/migrations"
 )
 
-// Store wraps the GORM handle and underlying sql.DB pool for PostgreSQL persistence.
+// Store 封装 PostgreSQL 持久化所需的 GORM 句柄与底层 sql.DB 连接池。
 type Store struct {
 	db    *gorm.DB
 	sqlDB *sql.DB
 }
 
-// Open connects to PostgreSQL via GORM, tunes connection pooling, and verifies connectivity.
+// Open 通过 GORM 连接 PostgreSQL、配置连接池参数并校验连通性。
 func Open(ctx context.Context, dsn string, gormLog gormlogger.Interface) (*Store, error) {
 	if gormLog == nil {
 		gormLog = gormlogger.Default.LogMode(gormlogger.Silent)
@@ -51,7 +51,7 @@ func Open(ctx context.Context, dsn string, gormLog gormlogger.Interface) (*Store
 	return &Store{db: db, sqlDB: sqlDB}, nil
 }
 
-// RunMigrations applies all embedded Goose SQL migrations against PostgreSQL.
+// RunMigrations 将内嵌的 Goose SQL 迁移脚本应用到 PostgreSQL。
 func (s *Store) RunMigrations(ctx context.Context) error {
 	provider, err := goose.NewProvider(goose.DialectPostgres, s.sqlDB, migrations.FS)
 	if err != nil {
@@ -63,12 +63,12 @@ func (s *Store) RunMigrations(ctx context.Context) error {
 	return nil
 }
 
-// Ping verifies PostgreSQL readiness within ctx.
+// Ping 在 ctx 超时范围内校验 PostgreSQL 可用性。
 func (s *Store) Ping(ctx context.Context) error {
 	return s.sqlDB.PingContext(ctx)
 }
 
-// Close releases all pooled database connections.
+// Close 释放所有数据库连接池资源。
 func (s *Store) Close() error {
 	if s == nil || s.sqlDB == nil {
 		return nil

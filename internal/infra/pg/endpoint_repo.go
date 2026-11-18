@@ -11,7 +11,7 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// CreateEndpoint persists a new Endpoint row.
+// CreateEndpoint 持久化一条新的 Endpoint 记录。
 func (s *Store) CreateEndpoint(ctx context.Context, ep domain.Endpoint) error {
 	po := toEndpointPO(ep)
 	if err := s.db.WithContext(ctx).Create(&po).Error; err != nil {
@@ -20,7 +20,7 @@ func (s *Store) CreateEndpoint(ctx context.Context, ep domain.Endpoint) error {
 	return nil
 }
 
-// GetEndpoint loads a single Endpoint by ID or returns domain.ErrEndpointNotFound.
+// GetEndpoint 根据 ID 查询单个 Endpoint，不存在时返回 domain.ErrEndpointNotFound。
 func (s *Store) GetEndpoint(ctx context.Context, id uuid.UUID) (domain.Endpoint, error) {
 	var po endpointPO
 	err := s.db.WithContext(ctx).Where("id = ?", id).First(&po).Error
@@ -33,7 +33,7 @@ func (s *Store) GetEndpoint(ctx context.Context, id uuid.UUID) (domain.Endpoint,
 	return toDomainEndpoint(po), nil
 }
 
-// ListEndpoints returns all registered Endpoints ordered newest first.
+// ListEndpoints 按创建时间倒序返回全部已注册的 Endpoint。
 func (s *Store) ListEndpoints(ctx context.Context) ([]domain.Endpoint, error) {
 	var pos []endpointPO
 	if err := s.db.WithContext(ctx).Order("created_at DESC, id DESC").Find(&pos).Error; err != nil {
@@ -46,7 +46,7 @@ func (s *Store) ListEndpoints(ctx context.Context) ([]domain.Endpoint, error) {
 	return out, nil
 }
 
-// UpdateEndpoint persists changes to an existing Endpoint or returns domain.ErrEndpointNotFound.
+// UpdateEndpoint 更新已有 Endpoint 的字段，记录不存在时返回 domain.ErrEndpointNotFound。
 func (s *Store) UpdateEndpoint(ctx context.Context, ep domain.Endpoint) error {
 	po := toEndpointPO(ep)
 	res := s.db.WithContext(ctx).

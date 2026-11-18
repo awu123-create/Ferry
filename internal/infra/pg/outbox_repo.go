@@ -6,26 +6,24 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// ClaimAndDispatchImmediateOutbox claims up to limit immediately due outbox rows
-// (deliver_at <= now()) using FOR UPDATE SKIP LOCKED inside a bounded transaction,
-// invokes dispatch, and physically deletes the rows on success (ADR-0002 & ADR-0008).
+// ClaimAndDispatchImmediateOutbox 在有界事务内通过 FOR UPDATE SKIP LOCKED 抢占最多 limit 条
+// 立即到期（deliver_at <= now()）的 outbox 记录，调用 dispatch 派发并在成功后物理删除（ADR-0002 & ADR-0008）。
 //
-// Implementation notes (Milestone 1 - core logic to be implemented):
-//  1. Bound the transaction context with the configured 5s hard timeout (passed by caller or derived)
-//     so a slow downstream Kafka publish never holds row locks and blocks PostgreSQL Autovacuum.
-//  2. Inside s.db.WithContext(ctx).Transaction:
-//     Query outboxPO with:
+// 实现指引（Milestone 1 核心逻辑，留待实现）：
+//  1. 调用方（或本方法内部）应为该批次事务绑定 5s 硬超时 Context，
+//     防止下游 Kafka 抖动时长期持有行锁阻塞 PostgreSQL Autovacuum。
+//  2. 在 s.db.WithContext(ctx).Transaction 中执行抢占查询：
 //     tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
 //     Where("deliver_at <= ?", time.Now().UTC()).
 //     Order("deliver_at ASC, id ASC").
 //     Limit(limit).
 //     Find(&rows)
-//  3. If len(rows) == 0: return 0, nil.
-//  4. Convert rows via toDomainOutboxItem and call dispatch(txCtx, items).
-//     If dispatch returns an error, return that error to roll back and release row locks.
-//  5. Physically delete the dispatched row IDs:
+//  3. 若 len(rows) == 0：直接返回 0, nil。
+//  4. 将行记录转为 []domain.OutboxItem 后调用 dispatch(txCtx, items)；
+//     若 dispatch 报错，返回错误以回滚事务并立即释放行锁。
+//  5. 物理删除已派发行的 ID：
 //     tx.Where("id IN ?", ids).Delete(&outboxPO{})
-//     and return len(items), nil.
+//     并返回 len(items), nil。
 func (s *Store) ClaimAndDispatchImmediateOutbox(
 	ctx context.Context,
 	limit int,
@@ -37,11 +35,10 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 	return 0, domain.ErrNotImplemented
 }
 
-// WaitForOutboxNotification listens on PostgreSQL channel 'ferry_outbox' until a notification arrives
-// or ctx is cancelled/timed out (ADR-0006 §2.3).
+// WaitForOutboxNotification 监听 PostgreSQL 通道 'ferry_outbox'，直到收到通知或 ctx 取消/超时（ADR-0006 §2.3）。
 //
-// Implementation notes (Milestone 1 - core logic to be implemented):
-//  1. Acquire a dedicated connection from s.sqlDB.Conn(ctx) and unwrap the underlying pgx connection:
+// 实现指引（Milestone 1 核心逻辑，留待实现）：
+//  1. 从 s.sqlDB.Conn(ctx) 获取专用连接，并解包底层 pgx 连接：
 //     var pgxConn *pgx.Conn
 //     conn.Raw(func(driverConn any) error {
 //     stdlibConn, ok := driverConn.(*stdlib.Conn) // github.com/jackc/pgx/v5/stdlib
@@ -49,8 +46,8 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 //     pgxConn = stdlibConn.Conn()
 //     return nil
 //     })
-//  2. Execute LISTEN ferry_outbox (on first acquire or keep a dedicated listener connection) and call
-//     pgxConn.WaitForNotification(ctx) so Relay wakes instantaneously without tight polling.
+//  2. 执行 LISTEN ferry_outbox（首次获取或复用专用监听连接），并调用
+//     pgxConn.WaitForNotification(ctx)，使 OutboxRelay 能够瞬时唤醒而非高频轮询。
 func (s *Store) WaitForOutboxNotification(ctx context.Context) error {
 	_ = ctx
 	return domain.ErrNotImplemented

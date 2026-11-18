@@ -11,15 +11,15 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// Config configures Worker concurrency, lock TTL grace, and graceful shutdown draining.
+// Config 配置 Worker 并发度、执行锁保护余量与优雅停机排空超时。
 type Config struct {
 	Concurrency          int
 	LockGrace            time.Duration
 	ShutdownDrainTimeout time.Duration
 }
 
-// Worker consumes ready Task tickets, guards execution with Execution Lock + optimistic CAS,
-// dispatches signed HTTP requests, and drains cleanly on SIGTERM.
+// Worker 消费就绪 Task 票据，通过 Execution Lock 与复合乐观锁守卫执行安全，
+// 发起带签名的出站 HTTP 投递，并在收到 SIGTERM 时执行优雅排空停机。
 type Worker struct {
 	log       *zap.Logger
 	stream    ReadyStream
@@ -31,7 +31,7 @@ type Worker struct {
 	ready     atomic.Bool
 }
 
-// NewWorker validates dependencies and constructs a Worker ready to start.
+// NewWorker 校验必需依赖并构造就绪可用的 Worker 实例。
 func NewWorker(
 	log *zap.Logger,
 	stream ReadyStream,
@@ -80,24 +80,24 @@ func NewWorker(
 	}, nil
 }
 
-// Ready reports whether the Worker is actively accepting Kafka deliveries (used by /readyz).
+// Ready 返回 Worker 当前是否正在接收并处理 Kafka 投递任务（供 /readyz 探针读取）。
 func (w *Worker) Ready() bool {
 	return w.ready.Load()
 }
 
-// Run polls ready tickets, processes them concurrently, and drains in-flight deliveries on ctx cancel.
+// Run 持续拉取就绪票据、受控并发投递，并在 ctx 取消时等待在途请求安全排空。
 //
-// Contract (Milestone 1 - core logic to be implemented, ADR-0006 & ADR-0008):
-//  1. Mark w.ready.Store(true) on startup.
-//  2. Loop until ctx.Done():
-//     - Poll batches via w.stream.PollReady(ctx, availableSlots) bounded by a semaphore of w.cfg.Concurrency.
-//     - Dispatch each ticket to a goroutine tracked by sync.WaitGroup calling w.ProcessTicket(drainCtx, ticket).
-//     - Periodically call w.stream.CommitCompleted(commitCtx) for contiguous completed watermarks.
-//  3. When ctx is cancelled (SIGTERM / SIGINT):
-//     - Immediately set w.ready.Store(false) so /readyz turns 503 and stop polling new tickets.
-//     - Wait for all in-flight goroutines up to w.cfg.ShutdownDrainTimeout (25s) using a detached drain context
-//     so active HTTP calls still finish SaveDeliveryOutcome and ReleaseExecutionLock cleanly.
-//     - Issue a final w.stream.CommitCompleted(commitCtx) before returning.
+// 契约要求（Milestone 1 核心逻辑，留待实现，见 ADR-0006 & ADR-0008）：
+//  1. 启动后立即设置 w.ready.Store(true)。
+//  2. 主循环直到 ctx.Done()：
+//     - 使用容量为 w.cfg.Concurrency 的信号量控制并发，通过 w.stream.PollReady(ctx, availableSlots) 拉取批次；
+//     - 为每条票据启动受 sync.WaitGroup 追踪的协程调用 w.ProcessTicket(drainCtx, ticket)；
+//     - 周期性调用 w.stream.CommitCompleted(commitCtx) 提交分区连续完成水位。
+//  3. 收到 ctx 取消（SIGTERM / SIGINT）后执行优雅停机：
+//     - 立即将 w.ready.Store(false) 使 /readyz 返回 503，同时停止向 Kafka 拉取新消息；
+//     - 在最长 w.cfg.ShutdownDrainTimeout（25s）内等待全部在途协程完成，期间使用分离后的 drainCtx，
+//     确保正在进行的 HTTP 调用仍能完整执行 SaveDeliveryOutcome 与 ReleaseExecutionLock；
+//     - 退出前执行最后一次 w.stream.CommitCompleted(commitCtx) 提交已处理完的连续 Offset。
 func (w *Worker) Run(ctx context.Context) error {
 	if !w.hasAllDependencies() {
 		return fmt.Errorf("worker is missing required dependencies")
@@ -114,23 +114,23 @@ func (w *Worker) Run(ctx context.Context) error {
 	return nil
 }
 
-// ProcessTicket executes Step A~E for one Kafka ReadyTicket.
+// ProcessTicket 对单条 Kafka ReadyTicket 执行 Step A~E 全流程处理。
 //
-// Contract (Milestone 1 - core logic to be implemented, ADR-0007 & ADR-0008):
-//   - Step A (Execution Lock): Load task/endpoint or acquire Execution Lock via
-//     w.locker.AcquireExecutionLock(ctx, ticket.TaskID, lockTTL) where lockTTL = timeout + w.cfg.LockGrace.
-//     If not acquired, skip safely (Milestone 2 will add ZADD NX fallback); always ReleaseExecutionLock
-//     in defer with context.WithoutCancel(ctx) AFTER DB outcome persistence.
-//   - Step B (Pre-Delivery Guard): Load task via w.tasks.GetTask and endpoint via w.endpoints.GetEndpoint.
-//     Call decision, err := task.EvaluatePreDelivery(ep, now):
-//   - If decision.AlreadyFinal or decision.EarlyArrival: call w.stream.Ack(ticket) and return nil
-//     (Milestone 2 adds ZADD back to ferry:delayed before ack on EarlyArrival).
-//   - If decision.DeadLetterCode != "": call w.tasks.SavePreDeliveryDeadLetter(...) and w.stream.Ack(ticket).
-//   - Step D (Outbound HTTP): Build domain.DeliveryRequest (with AttemptNo = task.Attempt+1,
-//     Timeout = time.Duration(ep.TimeoutMs)*time.Millisecond, RawPayload = task.Payload) and call w.sender.Send.
-//   - Step E (Outcome Persistence): Call transition, err := task.RecordOutcome(result, time.Now().UTC()),
-//     persist via w.tasks.SaveDeliveryOutcome(ctx, loadedReplay, loadedAttempt, task, transition.Attempt),
-//     and ack the ticket via w.stream.Ack(ticket) on success.
+// 契约要求（Milestone 1 核心逻辑，留待实现，见 ADR-0007 & ADR-0008）：
+//   - Step A（执行互斥锁 Execution Lock）：通过 w.locker.AcquireExecutionLock(ctx, ticket.TaskID, lockTTL)
+//     抢占执行权，其中 lockTTL = timeout + w.cfg.LockGrace。
+//     若未抢到锁则安全跳过（Milestone 2 会补充 ZADD NX 保底顺延）；
+//     务必在 defer 中使用 context.WithoutCancel(ctx) 调用 ReleaseExecutionLock，保证在 PG 事务提交后才放锁。
+//   - Step B（投递前守卫）：通过 w.tasks.GetTask 与 w.endpoints.GetEndpoint 加载 Task 与 Endpoint，
+//     调用 decision, err := task.EvaluatePreDelivery(ep, now)：
+//   - 若 decision.AlreadyFinal 或 decision.EarlyArrival：调用 w.stream.Ack(ticket) 后直接返回 nil
+//     （Milestone 2 在 EarlyArrival 时会先 ZADD 回延迟池再 Ack）。
+//   - 若 decision.DeadLetterCode != ""：调用 w.tasks.SavePreDeliveryDeadLetter(...) 落入死信并 Ack 票据。
+//   - Step D（出站 HTTP 投递）：构造 domain.DeliveryRequest（AttemptNo = task.Attempt + 1，
+//     Timeout = time.Duration(ep.TimeoutMs) * time.Millisecond，RawPayload = task.Payload）并调用 w.sender.Send。
+//   - Step E（状态结算与审计落盘）：调用 transition, err := task.RecordOutcome(result, time.Now().UTC())，
+//     通过 w.tasks.SaveDeliveryOutcome(ctx, loadedReplay, loadedAttempt, task, transition.Attempt) 单事务持久化，
+//     完成后调用 w.stream.Ack(ticket) 推进提交水位。
 func (w *Worker) ProcessTicket(ctx context.Context, ticket domain.ReadyTicket) error {
 	_ = ctx
 	_ = ticket

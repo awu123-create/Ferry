@@ -9,12 +9,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Registry owns a dedicated Prometheus registry exposed over /metrics.
+// Registry 封装通过 /metrics 暴露的独立 Prometheus 指标注册表。
 type Registry struct {
 	reg *prometheus.Registry
 }
 
-// NewRegistry creates a Prometheus registry with Go runtime and process collectors.
+// NewRegistry 创建已注册 Go 运行时与进程采集器的 Prometheus 注册表。
 func NewRegistry() (*Registry, error) {
 	reg := prometheus.NewRegistry()
 	if err := reg.Register(collectors.NewGoCollector()); err != nil {
@@ -26,12 +26,12 @@ func NewRegistry() (*Registry, error) {
 	return &Registry{reg: reg}, nil
 }
 
-// Prometheus returns the underlying registry so future milestones can register domain metrics.
+// Prometheus 返回底层注册表，供后续 Milestone 注册业务指标。
 func (r *Registry) Prometheus() *prometheus.Registry {
 	return r.reg
 }
 
-// Handler returns an HTTP handler serving Prometheus exposition format.
+// Handler 返回提供 Prometheus 指标导出格式的 HTTP Handler。
 func (r *Registry) Handler() http.Handler {
 	return promhttp.HandlerFor(r.reg, promhttp.HandlerOpts{
 		Registry: r.reg,

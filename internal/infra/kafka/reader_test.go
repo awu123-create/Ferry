@@ -35,7 +35,7 @@ func TestOffsetTrackerContiguousWatermarks(t *testing.T) {
 		t.Fatalf("expected contiguous watermark 13 (epoch 1), got %+v", got)
 	}
 
-	// Simulate commit failure followed by a newer watermark advancing.
+	// 模拟提交失败后，新水位继续推进应保留更高水位。
 	tracker.restoreCommittable(got)
 	t13 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 0, Offset: 13, Epoch: 2}
 	tracker.recordPolled([]domain.ReadyTicket{t13})

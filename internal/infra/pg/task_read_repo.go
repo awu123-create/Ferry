@@ -11,7 +11,7 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// GetTask loads a single Task row by ID without loading DeliveryAttempt history (ADR-0007).
+// GetTask 根据 ID 读取单行 Task，不加载历史 DeliveryAttempt 明细以防聚合膨胀（ADR-0007）。
 func (s *Store) GetTask(ctx context.Context, id uuid.UUID) (domain.Task, error) {
 	var po taskPO
 	err := s.db.WithContext(ctx).Where("id = ?", id).First(&po).Error
@@ -28,7 +28,7 @@ func (s *Store) GetTask(ctx context.Context, id uuid.UUID) (domain.Task, error) 
 	return task, nil
 }
 
-// ListDeliveryAttempts returns append-only DeliveryAttempt rows for a Task ordered chronologically.
+// ListDeliveryAttempts 按时间顺序返回指定 Task 的只追加 DeliveryAttempt 流水记录。
 func (s *Store) ListDeliveryAttempts(ctx context.Context, taskID uuid.UUID) ([]domain.DeliveryAttempt, error) {
 	if _, err := s.GetTask(ctx, taskID); err != nil {
 		return nil, err

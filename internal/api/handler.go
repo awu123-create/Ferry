@@ -19,7 +19,7 @@ const (
 	readinessTimeout       = 2 * time.Second
 )
 
-// HandlerConfig configures inbound validation limits and defaults for the HTTP API.
+// HandlerConfig 配置 HTTP API 的入站校验上限与默认任务参数。
 type HandlerConfig struct {
 	DefaultMaxAttempts int
 	DefaultTaskWindow  time.Duration
@@ -27,7 +27,7 @@ type HandlerConfig struct {
 	CancelLockTTL      time.Duration
 }
 
-// Handler exposes Ferry's REST control plane and health endpoints over net/http.
+// Handler 通过标准库 net/http 暴露 Ferry 控制面 REST 接口与健康检查端点。
 type Handler struct {
 	log       *zap.Logger
 	endpoints EndpointStore
@@ -38,7 +38,7 @@ type Handler struct {
 	mux       *http.ServeMux
 }
 
-// NewHandler constructs the HTTP control plane handler and registers all Milestone 1 routes.
+// NewHandler 构造 HTTP 控制面处理器并注册全部 Milestone 1 路由。
 func NewHandler(
 	log *zap.Logger,
 	endpoints EndpointStore,
@@ -85,7 +85,7 @@ func NewHandler(
 	return h, nil
 }
 
-// ServeHTTP dispatches inbound HTTP requests through the configured ServeMux.
+// ServeHTTP 将入站 HTTP 请求分发给已配置的 ServeMux。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mux.ServeHTTP(w, r)
 }

@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ServerConfig holds 12-factor configuration for ferry-server.
+// ServerConfig 保存 ferry-server 的 12-Factor 环境变量配置。
 type ServerConfig struct {
 	HTTPAddr             string
 	MetricsAddr          string
@@ -30,7 +30,7 @@ type ServerConfig struct {
 	ShutdownDrainTimeout time.Duration
 }
 
-// WorkerConfig holds 12-factor configuration for ferry-worker.
+// WorkerConfig 保存 ferry-worker 的 12-Factor 环境变量配置。
 type WorkerConfig struct {
 	ProbeAddr               string
 	MetricsAddr             string
@@ -49,7 +49,7 @@ type WorkerConfig struct {
 	ShutdownDrainTimeout    time.Duration
 }
 
-// ReceiverConfig holds 12-factor configuration for chaos-receiver.
+// ReceiverConfig 保存 chaos-receiver 的 12-Factor 环境变量配置。
 type ReceiverConfig struct {
 	HTTPAddr      string
 	SigningSecret string
@@ -58,7 +58,7 @@ type ReceiverConfig struct {
 	LogLevel      string
 }
 
-// LoadServerConfig parses and validates ferry-server environment configuration.
+// LoadServerConfig 解析并校验 ferry-server 的环境变量配置。
 func LoadServerConfig() (ServerConfig, error) {
 	cfg := ServerConfig{
 		HTTPAddr:             envString("FERRY_HTTP_ADDR", ":8080"),
@@ -171,7 +171,7 @@ func (c ServerConfig) validate() error {
 	return nil
 }
 
-// LoadWorkerConfig parses and validates ferry-worker environment configuration.
+// LoadWorkerConfig 解析并校验 ferry-worker 的环境变量配置。
 func LoadWorkerConfig() (WorkerConfig, error) {
 	cfg := WorkerConfig{
 		ProbeAddr:               envString("FERRY_WORKER_PROBE_ADDR", ":8082"),
@@ -260,7 +260,7 @@ func (c WorkerConfig) validate() error {
 	return nil
 }
 
-// LoadReceiverConfig parses and validates chaos-receiver environment configuration.
+// LoadReceiverConfig 解析并校验 chaos-receiver 的环境变量配置。
 func LoadReceiverConfig() (ReceiverConfig, error) {
 	cfg := ReceiverConfig{
 		HTTPAddr:      envString("FERRY_RECEIVER_ADDR", ":8081"),

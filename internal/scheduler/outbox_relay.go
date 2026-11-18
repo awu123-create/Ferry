@@ -10,14 +10,14 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// OutboxRelayConfig configures batching and timing for OutboxRelay.
+// OutboxRelayConfig 配置 OutboxRelay 的批量大小、兜底轮询周期与单批硬超时。
 type OutboxRelayConfig struct {
 	BatchSize    int
 	PollInterval time.Duration
 	BatchTimeout time.Duration
 }
 
-// OutboxRelay drains immediately due outbox rows into Kafka via LISTEN/NOTIFY and fallback polling.
+// OutboxRelay 通过 LISTEN/NOTIFY 与兜底定时轮询，将立即到期的 outbox 行搬运至 Kafka。
 type OutboxRelay struct {
 	log       *zap.Logger
 	outbox    OutboxStore
@@ -25,7 +25,7 @@ type OutboxRelay struct {
 	cfg       OutboxRelayConfig
 }
 
-// NewOutboxRelay validates dependencies and constructs an OutboxRelay.
+// NewOutboxRelay 校验依赖并构造 OutboxRelay 实例。
 func NewOutboxRelay(
 	log *zap.Logger,
 	outbox OutboxStore,
@@ -58,13 +58,13 @@ func NewOutboxRelay(
 	}, nil
 }
 
-// Run executes the immediate-channel Outbox Relay loop until ctx is cancelled.
+// Run 驱动立即通道 OutboxRelay 循环，直到 ctx 被取消。
 //
-// Contract (Milestone 1 - core logic to be implemented, ADR-0002 & ADR-0008):
-//  1. Drain pending immediate rows via r.RelayOnce(ctx) in a loop while claimed >= r.cfg.BatchSize.
-//  2. Wait for the next wakeup using either r.outbox.WaitForOutboxNotification(waitCtx)
-//     (woken by PostgreSQL trigger notify_ferry_outbox) or r.cfg.PollInterval (500ms fallback).
-//  3. Handle transient errors by logging/backing off briefly without tight looping, and return nil on ctx.Done().
+// 契约要求（Milestone 1 核心逻辑，留待实现，见 ADR-0002 & ADR-0008）：
+//  1. 当 claimed >= r.cfg.BatchSize 时持续调用 r.RelayOnce(ctx) 排空积压的立即通道记录。
+//  2. 排空后阻塞等待下一次唤醒：优先监听 r.outbox.WaitForOutboxNotification(waitCtx)
+//     （由 PostgreSQL 触发器 notify_ferry_outbox 瞬时唤醒），并以 r.cfg.PollInterval（500ms）作为兜底定时。
+//  3. 遇到瞬时错误时记录日志并短暂退避，避免空转打爆数据库，收到 ctx.Done() 后返回 nil。
 func (r *OutboxRelay) Run(ctx context.Context) error {
 	if !r.hasAllDependencies() {
 		return fmt.Errorf("outbox relay is missing required dependencies")
@@ -80,13 +80,13 @@ func (r *OutboxRelay) Run(ctx context.Context) error {
 	return nil
 }
 
-// RelayOnce claims and dispatches one bounded batch of immediate outbox items.
+// RelayOnce 抢占并派发单批有界的立即到期 Outbox 记录。
 //
-// Contract (Milestone 1 - core logic to be implemented):
-//  1. Bound the batch transaction with batchCtx, cancel := context.WithTimeout(ctx, r.cfg.BatchTimeout)
-//     (5s hard cap to protect PG Autovacuum).
-//  2. Call r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.cfg.BatchSize, dispatch),
-//     where dispatch extracts each item.TaskID and calls r.publisher.PublishTaskIDs(txCtx, taskIDs).
+// 契约要求（Milestone 1 核心逻辑，留待实现）：
+//  1. 使用 batchCtx, cancel := context.WithTimeout(ctx, r.cfg.BatchTimeout) 绑定单批事务 5s 硬超时，
+//     防止慢发布长期持锁阻塞 PostgreSQL Autovacuum。
+//  2. 调用 r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.cfg.BatchSize, dispatch)，
+//     在 dispatch 回调中提取每条 item.TaskID 并调用 r.publisher.PublishTaskIDs(txCtx, taskIDs)。
 func (r *OutboxRelay) RelayOnce(ctx context.Context) (int, error) {
 	_ = ctx
 	return 0, domain.ErrNotImplemented

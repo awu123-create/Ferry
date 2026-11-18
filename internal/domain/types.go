@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// TaskStatus represents the five persisted lifecycle states of a Task.
+// TaskStatus 表示 Task 持久化生命周期的五种状态。
 type TaskStatus string
 
 const (
@@ -20,7 +20,7 @@ const (
 	TaskStatusCancelled  TaskStatus = "CANCELLED"
 )
 
-// ParseTaskStatus validates and converts a persisted status string into TaskStatus.
+// ParseTaskStatus 校验并将持久化的状态字符串解析为 TaskStatus。
 func ParseTaskStatus(raw string) (TaskStatus, error) {
 	switch TaskStatus(raw) {
 	case TaskStatusPending,
@@ -34,17 +34,17 @@ func ParseTaskStatus(raw string) (TaskStatus, error) {
 	}
 }
 
-// IsTerminal reports whether the Task has reached a final state.
+// IsTerminal 判断 Task 是否已进入终态。
 func (s TaskStatus) IsTerminal() bool {
 	return s == TaskStatusSucceeded || s == TaskStatusDeadLetter || s == TaskStatusCancelled
 }
 
-// IsActive reports whether the Task is still eligible for delivery or cancellation.
+// IsActive 判断 Task 是否仍处于可调度或可取消的非终态。
 func (s TaskStatus) IsActive() bool {
 	return s == TaskStatusPending || s == TaskStatusRetrying
 }
 
-// AttemptErrorKind classifies the outbound HTTP outcome of a single Delivery Attempt.
+// AttemptErrorKind 对单次投递尝试（Delivery Attempt）的出站 HTTP 结果进行错误分类。
 type AttemptErrorKind string
 
 const (
@@ -57,17 +57,17 @@ const (
 )
 
 const (
-	// DeadLetterReasonDeadlineExceeded records termination due to crossing DeadlineAt.
+	// DeadLetterReasonDeadlineExceeded 记录因越过 DeadlineAt 截止时间而终止投递的死信原因码。
 	DeadLetterReasonDeadlineExceeded = "TTL_EXPIRED"
-	// DeadLetterReasonEndpointDisabled records termination because the Endpoint was disabled.
+	// DeadLetterReasonEndpointDisabled 记录因目标 Endpoint 已被禁用而终止投递的死信原因码。
 	DeadLetterReasonEndpointDisabled = "ENDPOINT_DISABLED"
-	// DeadLetterReasonNonRetryable4xx records termination on a non-retryable 4xx contract error.
+	// DeadLetterReasonNonRetryable4xx 记录因遭遇不可重试 4xx 契约错误而转入死信的原因码。
 	DeadLetterReasonNonRetryable4xx = "NON_RETRYABLE_4XX"
-	// DeadLetterReasonMaxAttemptsExhausted records termination after exhausting MaxAttempts.
+	// DeadLetterReasonMaxAttemptsExhausted 记录因耗尽最大尝试次数而转入死信的原因码。
 	DeadLetterReasonMaxAttemptsExhausted = "MAX_ATTEMPTS_EXHAUSTED"
 )
 
-// Task is the aggregate root representing a single reliable HTTP POST delivery unit.
+// Task 是表示单次可靠 HTTP POST 投递单元与生命周期的聚合根。
 type Task struct {
 	ID             uuid.UUID
 	EndpointID     uuid.UUID
@@ -87,7 +87,7 @@ type Task struct {
 	CompletedAt    *time.Time
 }
 
-// DeliveryAttempt is an immutable append-only audit record for one HTTP attempt.
+// DeliveryAttempt 表示一次实际发出 HTTP 请求后生成的不可变、只追加投递尝试记录。
 type DeliveryAttempt struct {
 	ID              int64
 	TaskID          uuid.UUID
@@ -101,7 +101,7 @@ type DeliveryAttempt struct {
 	CreatedAt       time.Time
 }
 
-// OutboxItem represents a pending dispatch intention recorded in the same transaction as a Task.
+// OutboxItem 表示与 Task 在同一事务边界内登记的事务发件箱（Outbox）调度意图。
 type OutboxItem struct {
 	ID        int64
 	TaskID    uuid.UUID
@@ -109,7 +109,7 @@ type OutboxItem struct {
 	CreatedAt time.Time
 }
 
-// DeliveryRequest carries all data needed by the outbound HTTP adapter to dispatch one attempt.
+// DeliveryRequest 承载出站 HTTP 适配器发起单次投递尝试所需的全部数据。
 type DeliveryRequest struct {
 	TaskID        uuid.UUID
 	EndpointURL   string
@@ -121,7 +121,7 @@ type DeliveryRequest struct {
 	SentAt        time.Time
 }
 
-// DeliveryResult summarizes the outcome of a single outbound HTTP attempt.
+// DeliveryResult 汇总单次出站 HTTP 投递尝试的返回结果。
 type DeliveryResult struct {
 	HTTPStatus      int
 	DurationMs      int
@@ -131,13 +131,13 @@ type DeliveryResult struct {
 	RetryAfter      time.Duration
 }
 
-// CreateTaskResult reports the Task and whether this submission created a new record.
+// CreateTaskResult 表示任务创建结果以及本次提交是否新建了 Task 记录。
 type CreateTaskResult struct {
 	Task    Task
 	Created bool
 }
 
-// ReadyTicket identifies a Task read from the ready stream along with its offset coordinates.
+// ReadyTicket 标识从就绪流中拉取到的 Task 及其偏移量坐标。
 type ReadyTicket struct {
 	TaskID    uuid.UUID
 	Topic     string
@@ -146,7 +146,7 @@ type ReadyTicket struct {
 	Epoch     int32
 }
 
-// ComputePayloadSHA256 returns the lowercase hex SHA-256 digest of rawPayload bytes.
+// ComputePayloadSHA256 计算原始载荷字节切片的小写十六进制 SHA-256 摘要。
 func ComputePayloadSHA256(rawPayload []byte) string {
 	sum := sha256.Sum256(rawPayload)
 	return hex.EncodeToString(sum[:])

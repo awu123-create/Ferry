@@ -2,7 +2,7 @@ package migrations
 
 import "embed"
 
-// FS embeds SQL migration files for Goose execution at startup or via CLI.
+// FS 嵌入供 Goose 在启动或 CLI 执行时使用的 SQL 迁移脚本。
 //
 //go:embed *.sql
 var FS embed.FS

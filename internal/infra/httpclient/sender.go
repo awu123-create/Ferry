@@ -22,13 +22,13 @@ const (
 	maxErrorMsgBytes       = 512
 )
 
-// Sender delivers HTTP POST requests with tuned pooling, raw-byte HMAC signing, and bounded responses.
+// Sender 使用调优后的连接池发起 HTTP POST 请求，支持原始字节 HMAC 签名与有界响应截断。
 type Sender struct {
 	client          *http.Client
 	maxSnippetBytes int
 }
 
-// NewSender constructs an outbound HTTP delivery client with tuned connection pooling.
+// NewSender 构造带连接池调优参数的出站 HTTP 投递客户端。
 func NewSender(maxSnippetBytes int) *Sender {
 	if maxSnippetBytes <= 0 {
 		maxSnippetBytes = defaultMaxSnippetBytes
@@ -51,7 +51,7 @@ func NewSender(maxSnippetBytes int) *Sender {
 	}
 }
 
-// Send executes a single outbound HTTP POST request using req.RawPayload verbatim.
+// Send 原样使用 req.RawPayload 发起单次出站 HTTP POST 请求并汇总结果。
 func (s *Sender) Send(ctx context.Context, req domain.DeliveryRequest) domain.DeliveryResult {
 	callCtx := ctx
 	var cancel context.CancelFunc

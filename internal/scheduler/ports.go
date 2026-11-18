@@ -8,7 +8,7 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// OutboxStore defines the PostgreSQL Outbox operations consumed by OutboxRelay.
+// OutboxStore 定义 OutboxRelay 消费的 PostgreSQL 事务发件箱操作接口。
 type OutboxStore interface {
 	ClaimAndDispatchImmediateOutbox(
 		ctx context.Context,
@@ -18,7 +18,7 @@ type OutboxStore interface {
 	WaitForOutboxNotification(ctx context.Context) error
 }
 
-// ReadyPublisher publishes due Task IDs to Kafka.
+// ReadyPublisher 定义向 Kafka 发布就绪 Task ID 的出站接口。
 type ReadyPublisher interface {
 	PublishTaskIDs(ctx context.Context, taskIDs []uuid.UUID) error
 }

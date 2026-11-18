@@ -11,15 +11,14 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
-// GormLogger adapts zap.Logger to GORM's logger interface with slow SQL warnings
-// and task_id context correlation.
+// GormLogger 将 zap.Logger 适配为 GORM 日志接口，支持慢 SQL 告警与 task_id 透传。
 type GormLogger struct {
 	log           *zap.Logger
 	slowThreshold time.Duration
 	level         gormlogger.LogLevel
 }
 
-// NewGormLogger constructs a GORM logger adapter.
+// NewGormLogger 构造 GORM 日志适配器。
 func NewGormLogger(log *zap.Logger, slowThreshold time.Duration) *GormLogger {
 	if log == nil {
 		log = zap.NewNop()
@@ -31,14 +30,14 @@ func NewGormLogger(log *zap.Logger, slowThreshold time.Duration) *GormLogger {
 	}
 }
 
-// LogMode returns a copy of the logger configured with the requested level.
+// LogMode 返回按指定日志级别复制的日志适配器副本。
 func (l *GormLogger) LogMode(level gormlogger.LogLevel) gormlogger.Interface {
 	cp := *l
 	cp.level = level
 	return &cp
 }
 
-// Info emits informational GORM messages when Info level is enabled.
+// Info 在开启 Info 级别时输出 GORM 信息日志。
 func (l *GormLogger) Info(ctx context.Context, msg string, data ...any) {
 	if l.level < gormlogger.Info {
 		return
@@ -46,7 +45,7 @@ func (l *GormLogger) Info(ctx context.Context, msg string, data ...any) {
 	l.log.Info(fmt.Sprintf(msg, data...), contextFields(ctx)...)
 }
 
-// Warn emits warning GORM messages when Warn level is enabled.
+// Warn 在开启 Warn 级别时输出 GORM 告警日志。
 func (l *GormLogger) Warn(ctx context.Context, msg string, data ...any) {
 	if l.level < gormlogger.Warn {
 		return
@@ -54,7 +53,7 @@ func (l *GormLogger) Warn(ctx context.Context, msg string, data ...any) {
 	l.log.Warn(fmt.Sprintf(msg, data...), contextFields(ctx)...)
 }
 
-// Error emits error GORM messages when Error level is enabled.
+// Error 在开启 Error 级别时输出 GORM 错误日志。
 func (l *GormLogger) Error(ctx context.Context, msg string, data ...any) {
 	if l.level < gormlogger.Error {
 		return
@@ -62,7 +61,7 @@ func (l *GormLogger) Error(ctx context.Context, msg string, data ...any) {
 	l.log.Error(fmt.Sprintf(msg, data...), contextFields(ctx)...)
 }
 
-// Trace logs SQL execution errors (excluding gorm.ErrRecordNotFound) and slow queries.
+// Trace 记录 SQL 执行错误（忽略 gorm.ErrRecordNotFound）与超过阈值的慢查询。
 func (l *GormLogger) Trace(ctx context.Context, begin time.Time, fc func() (string, int64), err error) {
 	if l.level <= gormlogger.Silent {
 		return

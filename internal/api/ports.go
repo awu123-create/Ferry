@@ -9,7 +9,7 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// EndpointStore defines the persistence operations required by the HTTP control plane for Endpoints.
+// EndpointStore 定义 HTTP 控制面对 Endpoint 所需的持久化操作。
 type EndpointStore interface {
 	CreateEndpoint(ctx context.Context, ep domain.Endpoint) error
 	GetEndpoint(ctx context.Context, id uuid.UUID) (domain.Endpoint, error)
@@ -17,7 +17,7 @@ type EndpointStore interface {
 	UpdateEndpoint(ctx context.Context, ep domain.Endpoint) error
 }
 
-// TaskStore defines the persistence operations required by the HTTP control plane for Tasks.
+// TaskStore 定义 HTTP 控制面对 Task 所需的持久化操作。
 type TaskStore interface {
 	CreateTaskIdempotent(ctx context.Context, task domain.Task, outbox domain.OutboxItem) (domain.CreateTaskResult, error)
 	GetTask(ctx context.Context, id uuid.UUID) (domain.Task, error)
@@ -25,13 +25,13 @@ type TaskStore interface {
 	CancelTask(ctx context.Context, taskID uuid.UUID, now time.Time) (domain.Task, error)
 }
 
-// ExecutionLocker provides mutual exclusion between in-flight Worker delivery and API cancellation.
+// ExecutionLocker 提供 Worker 在途投递与 API 取消操作之间的执行互斥保护。
 type ExecutionLocker interface {
 	AcquireExecutionLock(ctx context.Context, taskID uuid.UUID, ttl time.Duration) (token string, acquired bool, err error)
 	ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error
 }
 
-// ReadinessProbe verifies downstream infrastructure availability for /readyz.
+// ReadinessProbe 用于 /readyz 检查下游基础设施组件的就绪状态。
 type ReadinessProbe interface {
 	Ping(ctx context.Context) error
 }

@@ -78,7 +78,7 @@ func TestChaosReceiverSignatureAndStats(t *testing.T) {
 		t.Fatalf("payload sha256 mismatch: %s", stat.LastPayloadSHA256)
 	}
 
-	// Bad signature must return 401.
+	// 错误签名必须返回 401。
 	badReq, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook?secret="+secret, bytes.NewReader(rawBody))
 	if err != nil {
 		t.Fatalf("new bad request: %v", err)
@@ -98,7 +98,7 @@ func TestChaosReceiverSignatureAndStats(t *testing.T) {
 		t.Fatalf("expected 401 on invalid signature, got %d", badResp.StatusCode)
 	}
 
-	// Path status override works when unsigned.
+	// 未开启验签时，路径中的状态码覆盖应生效。
 	failReq, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+"/webhook/400", bytes.NewReader(rawBody))
 	if err != nil {
 		t.Fatalf("new 400 request: %v", err)
