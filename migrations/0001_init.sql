@@ -35,13 +35,16 @@ CREATE TABLE tasks (
     completed_at    TIMESTAMPTZ
 );
 
+-- 入口数据库级并发幂等防重
 CREATE UNIQUE INDEX tasks_endpoint_idempotency_uq
     ON tasks (endpoint_id, idempotency_key);
 
+-- 部分索引，这个索引主要是为了 reconcile 能快速扫描在途任务
 CREATE INDEX tasks_reconcile_idx
     ON tasks (next_run_at ASC, id ASC)
     WHERE status IN ('PENDING', 'RETRYING');
 
+-- 部分索引，这个索引主要是为了加速死信任务的查询和按端点批量重放
 CREATE INDEX tasks_dlq_idx
     ON tasks (endpoint_id, created_at DESC)
     WHERE status = 'DEAD_LETTER';
@@ -59,6 +62,8 @@ CREATE TABLE task_attempts (
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 为避免两个 worker 同时双发，这里使用乐观锁保证只有其中一个能改变任务状态
+-- 做成普通索引的主要原因是 task_attempts 表中能同时记录落败的记录，便于审计
 CREATE INDEX task_attempts_task_round_idx
     ON task_attempts (task_id, replay_count, attempt_no);
 
@@ -69,6 +74,7 @@ CREATE TABLE outbox (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 加速 forwarder 扫描待投递的任务，避免全表扫描
 CREATE INDEX outbox_deliver_idx
     ON outbox (deliver_at ASC, id ASC);
 
