@@ -1,6 +1,6 @@
 # ADR-0003: 延迟与退避重试采用 Redis ZSet 租约倒计时池加 PG 对账兜底
 
-- **状态**：已采纳（Accepted）
+- **状态**：已采纳（部分细则已由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：拉长默认指数退避档位、Forwarder 改为比对租约分数条件 `ZREM`、Reconciler 改为游标循环排空并以 `ZADD NX` 回写延迟池）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）

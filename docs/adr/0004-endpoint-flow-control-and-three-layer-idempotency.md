@@ -1,6 +1,6 @@
 # ADR-0004: Endpoint 级三维流控隔离与全链路三层幂等机制
 
-- **状态**：已采纳（Accepted）
+- **状态**：已采纳（部分细则已由 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：顺延改为按 `1/QPS` 虚拟排号摊平、半开试探加超时、`deadline_at` 改为首次触发时间起算、补齐执行锁四步协议与复合乐观版本 CAS）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）

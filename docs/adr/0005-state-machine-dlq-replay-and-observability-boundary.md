@@ -1,6 +1,6 @@
 # ADR-0005: 状态机与投递明细、死信受控重放及可观测优先交付边界
 
-- **状态**：已采纳（Accepted）
+- **状态**：已采纳（部分细则已由 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：持久化状态收敛为五态、取消改为抢占执行锁互斥、`task_attempts` 增加 `replay_count` 列、退避档位拉长至小时级）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）
@@ -29,7 +29,7 @@
 2. **严格的 HTTP 响应分类**：
    - `2xx`（200~299）：立即迁移至 `SUCCEEDED`；
    - `408 Request Timeout`、`429 Too Many Requests`、`5xx`（500~599）、DNS/TCP/TLS/读超时等网络错误：判定为**可重试错误**。若存在有效 `Retry-After` 响应头（仅限 `429`/`503`），优先按其计算下一次调度时间（封顶不超过 `3600s`），否则按指数退避 `min(max_backoff, base * 2^(attempt-1)) + full_jitter`；当 `attempt >= max_attempts` 或当前已超过 `deadline_at` 时落入 `DEAD_LETTER`；
-   - 其余 `4xx`（`400`/`401`/`403`/`404`/`410`/`422` 等）：判定为**不可重试契约/权限错误**，直接落入 `DEAD_LETTER`（记 `last_error_code = NON_RETRYABLE_4XX`），不浪费重试配额与熔断计数器；
+   - 其余 `4xx`（`400`/`401`/`403`/`404`/`410`/`422` 等）：判定为**不可重试契约/权限错误**，直接落入 `DEAD_LETTER`（记 `last_error = 'NON_RETRYABLE_4XX'`），不浪费重试配额与熔断计数器；
    - 取消守卫：`POST /v1/tasks/{id}/cancel` 仅允许从 `PENDING` 或 `RETRYING` 迁移至 `CANCELLED`，对已在途 `RUNNING` 或终态请求返回 `409 Conflict`。
 
 ### 二、投递流水审计（`task_attempts`）与受控死信重放

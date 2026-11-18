@@ -25,10 +25,266 @@ linters:
     - unconvert
     - misspell
     - nolintlint
+    - depguard
   settings:
     nolintlint:
       require-explanation: true
       require-specific: true
+    depguard:
+      rules:
+        domain:
+          list-mode: strict
+          files:
+            - "**/internal/domain/**"
+          allow:
+            - $gostd
+            - github.com/google/uuid
+            - github.com/awu123-create/ferry/internal/domain
+          deny:
+            - pkg: net/http
+              desc: "domain must remain transport-agnostic; keep HTTP details in internal/api or internal/infra/httpclient"
+            - pkg: database/sql
+              desc: "domain must remain persistence-agnostic; keep SQL details in internal/infra/pg"
+
+        api:
+          list-mode: strict
+          files:
+            - "**/internal/api/**"
+          allow:
+            - $gostd
+            - github.com/google/uuid
+            - go.uber.org/zap
+            - golang.org/x/sync
+            - github.com/awu123-create/ferry/internal/domain
+            - github.com/awu123-create/ferry/internal/config
+            - github.com/awu123-create/ferry/internal/logger
+            - github.com/awu123-create/ferry/internal/metrics
+            - github.com/awu123-create/ferry/internal/api
+          deny:
+            - pkg: database/sql
+              desc: "api must not use database/sql directly; isolate persistence behind consumer ports"
+            - pkg: github.com/awu123-create/ferry/internal/infra
+              desc: "api must depend on consumer-defined ports rather than concrete infra adapters"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "api must not couple directly to scheduler"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "api must not couple directly to worker"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "internal packages must not import cmd assembly roots"
+            - pkg: gorm.io/
+              desc: "api must not import GORM directly; isolate persistence behind consumer ports"
+            - pkg: github.com/jackc/pgx
+              desc: "api must not import pgx directly; isolate persistence behind consumer ports"
+            - pkg: github.com/twmb/franz-go
+              desc: "api must not import franz-go directly; isolate Kafka behind consumer ports"
+            - pkg: github.com/redis/go-redis
+              desc: "api must not import go-redis directly; isolate Redis behind consumer ports"
+            - pkg: github.com/pressly/goose
+              desc: "api must not import goose directly; keep migrations in internal/infra/pg"
+
+        scheduler:
+          list-mode: strict
+          files:
+            - "**/internal/scheduler/**"
+          allow:
+            - $gostd
+            - github.com/google/uuid
+            - go.uber.org/zap
+            - golang.org/x/sync
+            - github.com/awu123-create/ferry/internal/domain
+            - github.com/awu123-create/ferry/internal/config
+            - github.com/awu123-create/ferry/internal/logger
+            - github.com/awu123-create/ferry/internal/metrics
+            - github.com/awu123-create/ferry/internal/scheduler
+          deny:
+            - pkg: net/http
+              desc: "scheduler must remain transport-agnostic; keep HTTP details in internal/api or internal/infra/httpclient"
+            - pkg: database/sql
+              desc: "scheduler must not use database/sql directly; isolate persistence behind consumer ports"
+            - pkg: github.com/awu123-create/ferry/internal/infra
+              desc: "scheduler must depend on consumer-defined ports rather than concrete infra adapters"
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "scheduler must not depend on inbound api package"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "scheduler must not couple directly to worker"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "internal packages must not import cmd assembly roots"
+            - pkg: gorm.io/
+              desc: "scheduler must not import GORM directly; isolate persistence behind consumer ports"
+            - pkg: github.com/jackc/pgx
+              desc: "scheduler must not import pgx directly; isolate persistence behind consumer ports"
+            - pkg: github.com/twmb/franz-go
+              desc: "scheduler must not import franz-go directly; isolate Kafka behind consumer ports"
+            - pkg: github.com/redis/go-redis
+              desc: "scheduler must not import go-redis directly; isolate Redis behind consumer ports"
+            - pkg: github.com/pressly/goose
+              desc: "scheduler must not import goose directly; keep migrations in internal/infra/pg"
+
+        worker:
+          list-mode: strict
+          files:
+            - "**/internal/worker/**"
+          allow:
+            - $gostd
+            - github.com/google/uuid
+            - go.uber.org/zap
+            - golang.org/x/sync
+            - github.com/awu123-create/ferry/internal/domain
+            - github.com/awu123-create/ferry/internal/config
+            - github.com/awu123-create/ferry/internal/logger
+            - github.com/awu123-create/ferry/internal/metrics
+            - github.com/awu123-create/ferry/internal/worker
+          deny:
+            - pkg: net/http
+              desc: "worker must remain transport-agnostic; inject outbound HTTP delivery via consumer port and expose Ready() to cmd"
+            - pkg: database/sql
+              desc: "worker must not use database/sql directly; isolate persistence behind consumer ports"
+            - pkg: github.com/awu123-create/ferry/internal/infra
+              desc: "worker must depend on consumer-defined ports rather than concrete infra adapters"
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "worker must not depend on inbound api package"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "worker must not couple directly to scheduler"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "internal packages must not import cmd assembly roots"
+            - pkg: gorm.io/
+              desc: "worker must not import GORM directly; isolate persistence behind consumer ports"
+            - pkg: github.com/jackc/pgx
+              desc: "worker must not import pgx directly; isolate persistence behind consumer ports"
+            - pkg: github.com/twmb/franz-go
+              desc: "worker must not import franz-go directly; isolate Kafka behind consumer ports"
+            - pkg: github.com/redis/go-redis
+              desc: "worker must not import go-redis directly; isolate Redis behind consumer ports"
+            - pkg: github.com/pressly/goose
+              desc: "worker must not import goose directly; keep migrations in internal/infra/pg"
+
+        infra_pg:
+          list-mode: lax
+          files:
+            - "**/internal/infra/pg/**"
+          deny:
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "infra/pg must not depend upward on api"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "infra/pg must not depend upward on scheduler"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "infra/pg must not depend upward on worker"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "infra/pg must not import cmd assembly roots"
+            - pkg: github.com/awu123-create/ferry/internal/infra/kafka
+              desc: "infra/pg must not depend on sibling adapter infra/kafka"
+            - pkg: github.com/awu123-create/ferry/internal/infra/redis
+              desc: "infra/pg must not depend on sibling adapter infra/redis"
+            - pkg: github.com/awu123-create/ferry/internal/infra/httpclient
+              desc: "infra/pg must not depend on sibling adapter infra/httpclient"
+            - pkg: net/http
+              desc: "infra/pg must remain free of HTTP transport dependencies"
+            - pkg: github.com/twmb/franz-go
+              desc: "infra/pg must not import Kafka client SDKs"
+            - pkg: github.com/redis/go-redis
+              desc: "infra/pg must not import Redis client SDKs"
+
+        infra_kafka:
+          list-mode: lax
+          files:
+            - "**/internal/infra/kafka/**"
+          deny:
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "infra/kafka must not depend upward on api"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "infra/kafka must not depend upward on scheduler"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "infra/kafka must not depend upward on worker"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "infra/kafka must not import cmd assembly roots"
+            - pkg: github.com/awu123-create/ferry/internal/infra/pg
+              desc: "infra/kafka must not depend on sibling adapter infra/pg"
+            - pkg: github.com/awu123-create/ferry/internal/infra/redis
+              desc: "infra/kafka must not depend on sibling adapter infra/redis"
+            - pkg: github.com/awu123-create/ferry/internal/infra/httpclient
+              desc: "infra/kafka must not depend on sibling adapter infra/httpclient"
+            - pkg: net/http
+              desc: "infra/kafka must remain free of HTTP transport dependencies"
+            - pkg: gorm.io/
+              desc: "infra/kafka must not import GORM"
+            - pkg: github.com/pressly/goose
+              desc: "infra/kafka must not import goose"
+            - pkg: github.com/redis/go-redis
+              desc: "infra/kafka must not import Redis client SDKs"
+
+        infra_redis:
+          list-mode: lax
+          files:
+            - "**/internal/infra/redis/**"
+          deny:
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "infra/redis must not depend upward on api"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "infra/redis must not depend upward on scheduler"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "infra/redis must not depend upward on worker"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "infra/redis must not import cmd assembly roots"
+            - pkg: github.com/awu123-create/ferry/internal/infra/pg
+              desc: "infra/redis must not depend on sibling adapter infra/pg"
+            - pkg: github.com/awu123-create/ferry/internal/infra/kafka
+              desc: "infra/redis must not depend on sibling adapter infra/kafka"
+            - pkg: github.com/awu123-create/ferry/internal/infra/httpclient
+              desc: "infra/redis must not depend on sibling adapter infra/httpclient"
+            - pkg: net/http
+              desc: "infra/redis must remain free of HTTP transport dependencies"
+            - pkg: gorm.io/
+              desc: "infra/redis must not import GORM"
+            - pkg: github.com/pressly/goose
+              desc: "infra/redis must not import goose"
+            - pkg: github.com/twmb/franz-go
+              desc: "infra/redis must not import Kafka client SDKs"
+
+        infra_httpclient:
+          list-mode: lax
+          files:
+            - "**/internal/infra/httpclient/**"
+          deny:
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "infra/httpclient must not depend upward on api"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "infra/httpclient must not depend upward on scheduler"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "infra/httpclient must not depend upward on worker"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "infra/httpclient must not import cmd assembly roots"
+            - pkg: github.com/awu123-create/ferry/internal/infra/pg
+              desc: "infra/httpclient must not depend on sibling adapter infra/pg"
+            - pkg: github.com/awu123-create/ferry/internal/infra/kafka
+              desc: "infra/httpclient must not depend on sibling adapter infra/kafka"
+            - pkg: github.com/awu123-create/ferry/internal/infra/redis
+              desc: "infra/httpclient must not depend on sibling adapter infra/redis"
+            - pkg: gorm.io/
+              desc: "infra/httpclient must not import GORM"
+            - pkg: github.com/pressly/goose
+              desc: "infra/httpclient must not import goose"
+            - pkg: github.com/twmb/franz-go
+              desc: "infra/httpclient must not import Kafka client SDKs"
+            - pkg: github.com/redis/go-redis
+              desc: "infra/httpclient must not import Redis client SDKs"
+
+        foundation:
+          list-mode: lax
+          files:
+            - "**/internal/config/**"
+            - "**/internal/logger/**"
+            - "**/internal/metrics/**"
+          deny:
+            - pkg: github.com/awu123-create/ferry/internal/api
+              desc: "foundation packages must not depend upward on api"
+            - pkg: github.com/awu123-create/ferry/internal/scheduler
+              desc: "foundation packages must not depend upward on scheduler"
+            - pkg: github.com/awu123-create/ferry/internal/worker
+              desc: "foundation packages must not depend upward on worker"
+            - pkg: github.com/awu123-create/ferry/internal/infra
+              desc: "foundation packages must not depend upward on infra adapters"
+            - pkg: github.com/awu123-create/ferry/cmd
+              desc: "foundation packages must not import cmd assembly roots"
 
 issues:
   max-issues-per-linter: 0

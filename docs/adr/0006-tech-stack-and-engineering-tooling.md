@@ -1,6 +1,6 @@
 # ADR-0006: Go 1.27 技术栈选型、GORM+Goose 职责边界与工程化门禁
 
-- **状态**：已采纳（Accepted）
+- **状态**：已采纳（包分层与 `depguard` 白名单细则已由 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 进一步细化）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）
@@ -50,10 +50,10 @@ Ferry 的总体架构与可靠性契约已在 [ADR-0001](./0001-unified-http-tas
 
 ### 三、工程化质量门禁
 
-1. **`Makefile`**：统一封装 `setup-hooks`、`fmt`、`lint`、`test`、`test-integration`、`migrate`、`up`、`down`；
-2. **`.golangci.yml`（v2）**：开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`（防漏关 HTTP 响应体泄漏连接）、`noctx`（强迫 HTTP/DB 调用带 `context.Context`）、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint` 与 `depguard`（锁死领域层不反向依赖基础设施实现）；
+1. **`Makefile`**：当前工程骨架阶段提供 `setup-hooks`、`fmt`、`lint`、`test`、`build` 五个基础目标；`test-integration`、`migrate`、`up`、`down` 随 Milestone 1 容器编排与迁移脚本同步落地；
+2. **`.golangci.yml`（v2）**：开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`（防漏关 HTTP 响应体泄漏连接）、`noctx`（强迫 HTTP/DB 调用带 `context.Context`）、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint` 与 `depguard`（以 `strict` 白名单锁死领域层与编排层不越界依赖基础设施实现）；
 3. **`.pre-commit-config.yaml`**：串联基础文件检查、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、`golangci-lint` 增量扫描与 `go test -short ./...`；
-4. **GitHub Actions CI（`.github/workflows/ci.yml`）**：包含 `lint-and-unit`（全量 lint + 竞态单测）与 `integration`（拉起 `deploy/docker-compose.yml` 真实容器跑 `goose` 迁移与集成测试，不引入 `testcontainers-go`）。
+4. **GitHub Actions CI（`.github/workflows/ci.yml`）**：当前骨架阶段运行 `verify` 任务（格式、ADR 编号、全量 lint、竞态单测与二进制编译）；`integration` 任务（拉起 `deploy/docker-compose.yml` 真实容器跑 `goose` 迁移与集成测试，不引入 `testcontainers-go`）随 Milestone 1 同步启用。
 
 ## 影响与取舍（Consequences & Trade-offs）
 

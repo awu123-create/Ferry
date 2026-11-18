@@ -2,6 +2,7 @@
 
 - **状态**：已采纳（Accepted）
 - **日期**：2026-11-16
+- **修订说明**：载荷 `BYTEA` 原始字节级保真契约详见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)
 
 ## 背景与问题（Context）
 
@@ -14,7 +15,7 @@
 ### 方案 1：统一可靠 HTTP 任务投递引擎（Point-to-Endpoint HTTP Push，采纳）
 - **核心抽象**：所有异步任务与 Webhook 统一抽象为“在指定投递时间 `deliver_at`，向已注册目标 `Endpoint` 发起一次带超时控制、幂等请求头与可选 HMAC 签名的 HTTP POST 投递”。
 - **适用范围**：
-  - **内部微服务异步/延迟任务**：上游提交目标内部接口 URL、JSON 载荷及可选延迟时间 `deliver_at`，Ferry 负责削峰、定时触发、失败退避与流控保护；
+  - **内部微服务异步/延迟任务**：上游指定已注册的目标 `Endpoint` ID、JSON 载荷及可选延迟时间 `deliver_at`（每个 `Endpoint` 一对一绑定完整 `target_url` 与独立流控配额），Ferry 负责削峰、定时触发、失败退避与流控保护；
   - **外部 Webhook 回调**：目标 `Endpoint` 配置 `signing_secret` 后，Ferry 在发送请求时自动签发 `X-Ferry-Timestamp` 与 `X-Ferry-Signature`，满足商户验签防篡改需求。
 
 ### 方案 2：纯事件订阅扇出网关（`Application -> EventType -> Subscription -> 1:N Delivery`）

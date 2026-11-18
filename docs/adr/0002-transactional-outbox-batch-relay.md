@@ -1,6 +1,6 @@
 # ADR-0002: 入口事务一致性采用 PG 同事务 Outbox 与 Go 批量搬运协程
 
-- **状态**：已采纳（Accepted）
+- **状态**：已采纳（部分细则已由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：Outbox 拆分为立即/延迟双通道取数、升级 `(deliver_at, id)` 复合索引、固定 `task_id` 分区键并增加单批 `5s` 事务硬超时）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）
