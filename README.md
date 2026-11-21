@@ -90,39 +90,44 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 
 ```text
 Ferry/
-├── .github/workflows/ci.yml   # GitHub Actions: gofmt、ADR 唯一性、golangci-lint v2、race 单测与二进制构建
+├── .github/workflows/ci.yml   # GitHub Actions: verify（格式/lint/短单测/构建）与 integration（真实 PG/Kafka/Redis 容器测试）
 ├── .golangci.yml              # golangci-lint v2 静态检查与 depguard 分层依赖门禁
 ├── .pre-commit-config.yaml    # 本地提交钩子 (基础检查、ADR 编号、gofmt、增量 lint、短单测)
 ├── GLOSSARY.md                # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
-├── Makefile                   # 统一开发与构建入口 (setup-hooks / fmt / lint / test / build)
+├── Makefile                   # 统一开发、容器编排与测试入口 (setup-hooks / fmt / lint / test / test-integration / up / down / migrate / build)
 ├── go.mod                     # Go 1.27 模块定义
 ├── cmd/
 │   ├── ferry-server/          # 组装根：API 网关 + Outbox Relay + Delayed Forwarder + PG Reconciler
 │   ├── ferry-worker/          # 组装根：Kafka 消费 + Redis Lua 准入 + HTTP 签名投递 + 优雅停机
 │   ├── chaos-receiver/        # 混沌故障注入靶场 (模拟延迟 / 500 / 429 / HMAC 验签)
 │   └── ferry-bench/           # 并发压测与多目标隔离性验证 CLI
-├── docs/                      # 架构蓝图 (ARCHITECTURE.md) 与 ADR 0001~0008
+├── docs/                      # 架构蓝图 (ARCHITECTURE.md)、测试规范 (TESTING.md) 与 ADR 0001~0008
 ├── internal/                  # 核心领域与深模块包 (domain / api / scheduler / worker / infra/{pg,kafka,redis,httpclient} / config / logger / metrics)
-├── migrations/                # Milestone 1 Goose SQL 迁移脚本与 embed.go (4 张核心表、部分索引与 NOTIFY 触发器)
-├── deploy/                    # Milestone 1~3 Docker Compose、Prometheus 与 Grafana 看板配置
+├── migrations/                # Goose SQL 迁移脚本与 embed.go (4 张核心表、部分索引与 NOTIFY 触发器)
+├── tests/integration/         # 按完整业务链路组织的端到端集成测试
+├── deploy/                    # Docker Compose、Prometheus 与 Grafana 看板配置
 ├── scripts/                   # Milestone 1~4 可重复自动化验收脚本 (verify_m1.sh ~ verify_m4.sh)
 └── web/                       # Milestone 4 极简只读监控与死信批量重放静态控制台
 ```
 
-### 快速校验（当前工程骨架）
+### 本地校验与运行
 
-前置要求：本机已安装 Go 1.27、[`golangci-lint v2`](https://golangci-lint.run/) 与 [`pre-commit`](https://pre-commit.com/)。
+前置要求：本机已安装 Go 1.27、Docker Compose、[`golangci-lint v2`](https://golangci-lint.run/) 与 [`pre-commit`](https://pre-commit.com/)。
 
 ```bash
 # 1. 安装 Git pre-commit 钩子（首次拉取仓库后执行）
 make setup-hooks
 
-# 2. 格式化检查、golangci-lint 静态扫描与竞态单元测试
+# 2. 格式化检查、golangci-lint 静态扫描与无容器快速单测
 make fmt
 make lint
 make test
 
-# 3. 编译全部 4 个核心二进制文件至 .build/
+# 3. 启动本地 PostgreSQL / Kafka / Redis 容器并运行全量真依赖集成测试
+make up
+make test-integration
+
+# 4. 编译全部 4 个核心二进制文件至 .build/
 make build
 ```
 
@@ -142,6 +147,7 @@ make build
 
 - [统一语言词表 (`GLOSSARY.md`)](./GLOSSARY.md)
 - [架构设计总纲 (`docs/ARCHITECTURE.md`)](./docs/ARCHITECTURE.md)
+- [Go 测试规范 (`docs/TESTING.md`)](./docs/TESTING.md)
 - [ADR-0001: 统一核心业务模型为可靠 HTTP 任务投递引擎](./docs/adr/0001-unified-http-task-delivery-model.md)
 - [ADR-0002: 入口事务一致性采用 PG 同事务 Outbox 与 Go 批量搬运协程](./docs/adr/0002-transactional-outbox-batch-relay.md)
 - [ADR-0003: 延迟与退避重试采用 Redis ZSet 租约倒计时池加 PG 对账兜底](./docs/adr/0003-redis-zset-lease-and-pg-reconciler.md)

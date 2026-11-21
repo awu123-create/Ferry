@@ -107,7 +107,7 @@
 ### 3.3 有界回退与防空转证明（同时约束“环路频率”与“总存活时长”）
 
 1. **环路频率有界（杜绝大积压空转风暴）**：当某下游限流（如 `20 QPS`）或触发熔断 `OPEN` 且瞬间涌入上万条任务时，`admit_endpoint.lua` 不采用固定 `1s` 盲目重试，而是维护每个 `Endpoint` 的虚拟空闲游标 `next_free_ms`，按 `1 / rate_limit_qps`（如每单 `+50ms`）将积压任务依次排号分摊至未来时间轴。每条受限任务仅在轮到自身配额槽位时被唤醒一次，彻底消除高频回灌对 Forwarder、共享 Kafka Topic 与 PG 读库的无效消耗。
-2. **总存活时长有界（`deadline_at` 硬截断）**：每条任务在创建或重放时均记录 `deadline_at`（默认**首次 `next_run_at + 24h`**，支持环境变量覆盖）。无论在 Step B 唤醒校验、流控虚拟排号越界还是退避重试计算阶段，一旦越过 `deadline_at`，Worker 立即将其通过乐观版本 CAS 写为终态 `DEAD_LETTER`（`last_error = 'TTL_EXPIRED'`）并停止入池，从数学上保证调度环路绝对收敛。
+2. **总存活时长有界（`deadline_at` 硬截断）**：每条任务在创建或重放时均记录 `deadline_at`（默认按 **`max(next_run_at, now) + 24h`** 计算，既兼容定时任务又防止历史 `deliver_at` 导致落地即过期，支持环境变量覆盖）。无论在 Step B 唤醒校验、流控虚拟排号越界还是退避重试计算阶段，一旦越过 `deadline_at`，Worker 立即将其通过乐观版本 CAS 写为终态 `DEAD_LETTER`（`last_error = 'TTL_EXPIRED'`）并停止入池，从数学上保证调度环路绝对收敛。
 
 ---
 
@@ -145,11 +145,15 @@
 
 | 目标操作 / 事件 | 允许的前置状态 | 状态机乐观版本与互斥守卫行为 |
 | :--- | :--- | :--- |
-| Worker 标记投递成功 (`SUCCEEDED`) | `PENDING`、`RETRYING` | 单事务内追加 `task_attempts`（含当前 `replay_count`）并执行 `WHERE id = $1 AND replay_count = $2 AND attempt = $3 AND status IN ('PENDING','RETRYING')`；极端锁超时与取消重叠时跳过状态覆盖但保留真实发生的审计行 |
+| Worker 标记投递成功 (`SUCCEEDED`) | `PENDING`、`RETRYING` | 拿到 `2xx` 状态码即判定成功（响应片段读取出错不改判失败）；单事务内追加 `task_attempts`（含当前 `replay_count`）并执行 `WHERE id = $1 AND replay_count = $2 AND attempt = $3 AND status IN ('PENDING','RETRYING')`；极端锁超时与取消重叠时跳过状态覆盖但保留真实发生的审计行 |
 | Worker 标记失败重试 (`RETRYING`) | `PENDING`、`RETRYING` | 单事务追加 `task_attempts`、递增 `attempt`、写入退避后的 `next_run_at`（带复合乐观锁条件）；事务提交后再将 `task_id` 写入 `ferry:delayed`（极端断连由 Reconciler 兜底） |
-| Worker 标记死信 (`DEAD_LETTER`) | `PENDING`、`RETRYING` | 不可重试 4xx（写 `task_attempts`）、超过 `max_attempts`、下次退避或当前已超 `deadline_at`、或 `Endpoint` 禁用（未发 HTTP 时不写 `task_attempts`）时通过复合乐观锁 CAS 落入，记录 `completed_at` |
-| 手动取消 (`CANCELLED`) | `PENDING`、`RETRYING`（且抢占到 `Execution Lock`） | 自身先执行 `SET NX` 抢占 `Execution Lock`（抢不到说明正在执行，立即返回 `409 Conflict`）；持锁期间执行 `WHERE id = $1 AND status IN ('PENDING','RETRYING')` 置 `CANCELLED`、清理延迟池并验主释放锁 |
+| Worker 标记死信 (`DEAD_LETTER`) | `PENDING`、`RETRYING` | 不可重试 `4xx`（写 `task_attempts`）、`3xx` 重定向（禁用自动跟随 `http.ErrUseLastResponse`，记 `UNEXPECTED_REDIRECT` 且不计入熔断）、超过 `max_attempts`、下次退避或当前已超 `deadline_at`、或 `Endpoint` 禁用（未发 HTTP 时不写 `task_attempts`）时通过复合乐观锁 CAS 落入，记录 `completed_at` |
+| 手动取消 (`CANCELLED`) | `PENDING`、`RETRYING`（且抢占到 `Execution Lock`） | 自身先执行 `SET NX` 抢占 `Execution Lock`（默认短锁 `10s`，抢不到说明正在执行，立即返回 `409 Conflict`）；持锁期间执行 `WHERE id = $1 AND status IN ('PENDING','RETRYING')` 置 `CANCELLED`、清理延迟池并验主释放锁 |
 | 死信重放 (`DEAD_LETTER -> PENDING`) | `DEAD_LETTER` | 使用 `FOR UPDATE SKIP LOCKED` 加锁更新 `status='PENDING', attempt=0, replay_count=replay_count+1, next_run_at=now(), deadline_at=now()+default_ttl`, 并同事务写 `outbox` |
+
+**入口与执行锁细则补充（Milestone 1 加固）**：
+- **入口幂等与校验**：`POST /v1/tasks` 对自定义 `headers` 按 RFC 7230 校验键名并拒绝控制字符值；幂等重放同时校验 `payload_sha256` 与自定义 `headers` 一致（任一不同返回 `409 Conflict`）。`PATCH /v1/endpoints/{id}` 采用基于 `updated_at` 的乐观锁条件更新（`WHERE id = ? AND updated_at = ?`），并发覆盖冲突返回 `409 ENDPOINT_CONFLICT`。
+- **执行锁动态续期与早到容差**：Worker Step A 先用 `15s` 短租约抢锁，读取 `Endpoint` 并通过前置守卫后，在发起出站 HTTP 前通过 Lua 验主脚本 `ExtendExecutionLock` 按 `timeout_ms + LockGrace` 续期，避免短超时任务白占长锁；Step B 早到检查内置 `1s` 时钟容差（`EarlyArrivalClockSkewTolerance`），防止多机小幅时钟偏差误判早到。
 
 ---
 
@@ -299,10 +303,10 @@ CREATE TRIGGER outbox_notify_trg
 
 ### 7.3 工程化质量门禁
 
-- **`Makefile`**：当前骨架阶段封装 `setup-hooks`、`fmt`、`lint`、`test`、`build`；`test-integration`、`migrate`、`up`、`down` 随 Milestone 1 容器与迁移脚本同步落地；
+- **`Makefile`**：统一封装 `setup-hooks`、`fmt`、`lint`、`test`（`-short` 无容器快测）、`test-integration`（全量真容器测试）、`build`、`up`、`down` 与 `migrate`；
 - **`.golangci.yml`（v2）**：强制开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`、`noctx`、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint` 与 `depguard`（对 `domain` 与 `{api,scheduler,worker}` 启用 `strict` 白名单门禁，锁死零跨层越界依赖）；
 - **`.pre-commit-config.yaml`**：基础文本/YAML/私钥检查、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、`golangci-lint` 增量扫描与 `go test -short ./...`；
-- **GitHub Actions CI（`.github/workflows/ci.yml`）**：当前骨架阶段运行 `verify`（格式、ADR 编号、全量 lint、竞态单测与二进制构建）；`integration`（基于 `deploy/docker-compose.yml` 跑 `goose` 迁移与真实 PG/Kafka/Redis 集成测试）随 Milestone 1 同步启用。
+- **测试分层与 CI（[docs/TESTING.md](./TESTING.md) & `.github/workflows/ci.yml`）**：纯模块单测放各自包内（内存 fake）；`internal/infra/{pg,redis,kafka}` 各自维护连接真实中间件的契约测试；`tests/integration/` 按完整业务链路组织端到端集成测试。CI 同时运行 `verify`（格式、ADR 编号、全量 lint、短单测与构建）与 `integration`（拉起 `deploy/docker-compose.yml` 真实 PG/Kafka/Redis 容器执行 `make test-integration`）。
 
 ---
 
@@ -327,27 +331,29 @@ CREATE TRIGGER outbox_notify_trg
   │   ├── chaos-receiver/      # 混沌故障注入靶场 (模拟延迟/500/429/验签)
   │   └── ferry-bench/         # 并发压测与隔离性验证 CLI
   ├── internal/
-  │   ├── domain/              # 纯 Go 领域内核：Endpoint/Task 聚合、DeliveryAttempt、值对象、签名与退避策略
-  │   ├── api/                 # 入站 HTTP 控制面深模块：ServeMux 路由、DTO 校验、直接编排幂等创建/取消/重放
+  │   ├── domain/              # 纯 Go 领域内核（按主题分文件：endpoint.go / task.go / delivery.go / errors.go，零数据库/队列字段泄漏）
+  │   ├── api/                 # 入站 HTTP 控制面深模块：ServeMux 路由、response.go 统一错误码与脱敏、直接编排幂等创建/取消/重放
   │   ├── scheduler/           # 后台调度深模块：OutboxRelay、DelayedForwarder、Reconciler
   │   ├── worker/              # 投递执行深模块：Step A~E 状态机、25s 优雅停机排空与 Redis 断连背压暂停
   │   ├── infra/               # 出站基础设施适配器环（消费方接口实现，禁止向上依赖）
-  │   │   ├── pg/              # GORM 仓储（私有 PO、同事务 Outbox、SKIP LOCKED、Goose 迁移挂载）
-  │   │   ├── kafka/           # twmb/franz-go 幂等生产者/消费者封装（含分区 Pause/Resume）
-  │   │   ├── redis/           # go-redis/v9 适配器（延迟池租约 Lua、admit_endpoint.lua 流控、Execution Lock）
-  │   │   └── httpclient/      # 调优 http.Transport 连接池、LimitReader 截断与 Retry-After 解析
+  │   │   ├── pg/              # GORM 仓储（私有 PO、同事务隐藏式 Outbox 回调 []uuid.UUID、SKIP LOCKED、Goose 迁移挂载）
+  │   │   ├── kafka/           # twmb/franz-go 幂等生产者/消费者封装（私有化 offsetCoord 与闭包 Ack、含分区 Pause/Resume）
+  │   │   ├── redis/           # go-redis/v9 适配器（延迟池租约 Lua、admit_endpoint.lua 流控、Execution Lock 抢锁/续期/释锁）
+  │   │   └── httpclient/      # 调优 http.Transport 连接池、禁用重定向、LimitReader 截断与 Retry-After 解析
   │   ├── config/              # 12-Factor 强类型环境变量解析
   │   ├── logger/              # zap JSON 日志、Sampler 采样限流与 GORM 慢 SQL Logger 适配
   │   └── metrics/             # Prometheus 指标定义
   ├── migrations/              # 0001_init.sql 与 embed.go（暴露 embed.FS 供 Goose 挂载）
+  ├── tests/integration/       # 按完整业务链路组织的端到端集成测试（真实 PG + Kafka + Redis 装配）
+  ├── docs/                    # ARCHITECTURE.md、TESTING.md 与 ADR 0001~0008
   ├── deploy/                  # docker-compose.yml, prometheus.yml, grafana/dashboards/
   ├── scripts/                 # verify_m1.sh ~ verify_m4.sh 可重复自动化验收脚本
   └── web/                     # Milestone 4 独立静态控制台 (仅消费 /v1/* REST API)
   ```
 - **模块分层与单向依赖边界**（详见 [ADR-0007](./adr/0007-tactical-ddd-and-deep-module-seams.md)、[ADR-0008](./adr/0008-concurrency-fencing-and-flow-control-hardening.md) 与 [GLOSSARY.md](../GLOSSARY.md)）：
   - **零透传原则**：不设立浅层 `internal/service` 包，由 `api`、`scheduler`、`worker` 直接消费 `domain` 与消费方窄接口；`worker` 通过纯方法 `Ready() bool` 交由组装根 `cmd/ferry-worker` 暴露 `/readyz`；
-  - **DO/PO 隔离与隐藏式 Outbox**：`domain` 零 ORM/JSON 标签；`gorm` PO 结构体私有化于 `internal/infra/pg` 内，并以 `CreateTaskIdempotent`、`SaveDeliveryOutcome`、`ReplayDeadLetters` 与绑定 `5s` 硬超时的双通道回调切口 `ClaimAndDispatchOutbox` 隐藏全部事务与发件箱细节；
-  - **依赖方向门禁**：仅 `cmd/*` 可同时引用编排模块与 `internal/infra/*` 完成组装与编译期接口断言，其余各层通过 `.golangci.yml` `depguard` 的 `strict` 白名单与跨包隔离规则硬性拦截。
+  - **DO/PO 隔离、隐藏式 Outbox 与协议隔离**：`domain` 零 ORM/JSON 标签，不包含 `OutboxItem` 或 Kafka 分区/偏移量字段；`gorm` PO 结构体私有化于 `internal/infra/pg` 内，并以 `CreateTaskIdempotent`、`SaveDeliveryOutcome`、`ReplayDeadLetters` 与绑定 `5s` 硬超时的回调切口 `ClaimAndDispatchImmediateOutbox`（直接传递 `[]uuid.UUID`）隐藏全部事务与发件箱细节；`internal/infra/kafka` 私有化 `offsetCoord`，对外仅暴露 `domain.ReadyDelivery{TaskID, Ack}` 闭包句柄；
+  - **依赖方向门禁**：仅 `cmd/*`（以及根目录 `tests/integration/`）可同时引用编排模块与 `internal/infra/*` 完成组装与编译期接口断言，其余各层通过 `.golangci.yml` `depguard` 的 `strict` 白名单与跨包隔离规则硬性拦截。
 
 ---
 
@@ -438,6 +444,7 @@ CREATE TRIGGER outbox_notify_trg
 ## 九、统一语言与架构决策索引（Glossary & ADR Index）
 
 - [统一语言词表（`GLOSSARY.md`）](../GLOSSARY.md)
+- [Go 测试规范（`docs/TESTING.md`）](./TESTING.md)
 - [ADR-0001: 统一核心业务模型为可靠 HTTP 任务投递引擎](./adr/0001-unified-http-task-delivery-model.md)
 - [ADR-0002: 入口事务一致性采用 PG 同事务 Outbox 与 Go 批量搬运协程](./adr/0002-transactional-outbox-batch-relay.md)
 - [ADR-0003: 延迟与退避重试采用 Redis ZSet 租约倒计时池加 PG 对账兜底](./adr/0003-redis-zset-lease-and-pg-reconciler.md)
