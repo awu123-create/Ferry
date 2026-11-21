@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	// maxEndpointTimeout 对应 Endpoint.TimeoutMs 允许的最大值，用于 Step A 抢锁时覆盖最坏执行时长。
-	maxEndpointTimeout   = time.Duration(domain.MaxEndpointTimeoutMs) * time.Millisecond
-	lockReleaseTimeout   = 5 * time.Second
-	pollErrorBackoff     = 200 * time.Millisecond
-	periodicCommitPeriod = 500 * time.Millisecond
-	finalCommitTimeout   = 5 * time.Second
+	// initialExecutionLockTTL 为 Step A 首次抢锁的短租约，仅覆盖读库与前置守卫；
+	// 读到 Endpoint 后再按 timeout_ms + LockGrace 做验主续期，避免短超时任务白占 75s 锁。
+	initialExecutionLockTTL = 15 * time.Second
+	lockReleaseTimeout      = 5 * time.Second
+	pollErrorBackoff        = 200 * time.Millisecond
+	periodicCommitPeriod    = 500 * time.Millisecond
+	finalCommitTimeout      = 5 * time.Second
 )
 
 // Config 配置 Worker 并发度、执行锁保护余量与优雅停机排空超时。
@@ -217,9 +218,9 @@ pollLoop:
 func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDelivery) error {
 	ctx = logger.WithTaskID(ctx, delivery.TaskID)
 
-	// Step A：先抢占 Redis 执行互斥锁（TTL 覆盖最长合法超时 + 保护余量），确保后续读取到最新任务快照。
-	lockTTL := maxEndpointTimeout + w.cfg.LockGrace
-	token, acquired, err := w.locker.AcquireExecutionLock(ctx, delivery.TaskID, lockTTL)
+	// Step A：先以短租约抢占 Redis 执行互斥锁，确保后续读取到最新任务快照；
+	// 读取到 Endpoint 实际 timeout_ms 后再按 timeout_ms + LockGrace 做验主续期。
+	token, acquired, err := w.locker.AcquireExecutionLock(ctx, delivery.TaskID, initialExecutionLockTTL)
 	if err != nil {
 		return fmt.Errorf("acquire execution lock: %w", err)
 	}
@@ -286,6 +287,16 @@ func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDeliv
 		}
 		ackDelivery(delivery)
 		return nil
+	}
+
+	// Step C（锁续期）：在发起出站 HTTP 请求前，按 Endpoint 实际超时与保护余量验主续期执行锁。
+	deliveryLockTTL := time.Duration(ep.TimeoutMs)*time.Millisecond + w.cfg.LockGrace
+	extended, err := w.locker.ExtendExecutionLock(ctx, delivery.TaskID, token, deliveryLockTTL)
+	if err != nil {
+		return fmt.Errorf("extend execution lock: %w", err)
+	}
+	if !extended {
+		return fmt.Errorf("execution lock lost before delivery for task %s", delivery.TaskID)
 	}
 
 	// Step D：原样发送 BYTEA 载荷并自动附带 X-Ferry-* 与 HMAC-SHA256 签名头。

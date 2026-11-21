@@ -41,6 +41,7 @@ type EndpointReader interface {
 // ExecutionLocker 提供单任务维度的 Worker 执行互斥锁，与 API 取消抢锁互斥。
 type ExecutionLocker interface {
 	AcquireExecutionLock(ctx context.Context, taskID uuid.UUID, ttl time.Duration) (token string, acquired bool, err error)
+	ExtendExecutionLock(ctx context.Context, taskID uuid.UUID, token string, ttl time.Duration) (extended bool, err error)
 	ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error
 }
 

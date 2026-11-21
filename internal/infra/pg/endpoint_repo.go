@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -46,12 +47,13 @@ func (s *Store) ListEndpoints(ctx context.Context) ([]domain.Endpoint, error) {
 	return out, nil
 }
 
-// UpdateEndpoint 更新已有 Endpoint 的字段，记录不存在时返回 domain.ErrEndpointNotFound。
-func (s *Store) UpdateEndpoint(ctx context.Context, ep domain.Endpoint) error {
+// UpdateEndpoint 基于 updated_at 乐观锁条件更新已有 Endpoint；
+// 记录不存在时返回 domain.ErrEndpointNotFound，并发修改冲突时返回 domain.ErrEndpointConflict。
+func (s *Store) UpdateEndpoint(ctx context.Context, ep domain.Endpoint, expectedUpdatedAt time.Time) error {
 	po := toEndpointPO(ep)
 	res := s.db.WithContext(ctx).
 		Model(&endpointPO{}).
-		Where("id = ?", ep.ID).
+		Where("id = ? AND updated_at = ?", ep.ID, expectedUpdatedAt.UTC()).
 		Updates(map[string]any{
 			"name":              po.Name,
 			"target_url":        po.TargetURL,
@@ -66,8 +68,17 @@ func (s *Store) UpdateEndpoint(ctx context.Context, ep domain.Endpoint) error {
 	if res.Error != nil {
 		return fmt.Errorf("update endpoint: %w", res.Error)
 	}
-	if res.RowsAffected == 0 {
+	if res.RowsAffected == 1 {
+		return nil
+	}
+
+	var exists endpointPO
+	err := s.db.WithContext(ctx).Select("id").Where("id = ?", ep.ID).First(&exists).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return domain.ErrEndpointNotFound
 	}
-	return nil
+	if err != nil {
+		return fmt.Errorf("check endpoint after update conflict: %w", err)
+	}
+	return domain.ErrEndpointConflict
 }

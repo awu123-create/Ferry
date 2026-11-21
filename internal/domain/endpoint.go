@@ -183,7 +183,11 @@ func (e *Endpoint) ApplyUpdate(params UpdateEndpointParams, now time.Time) error
 		next.Enabled = *params.Enabled
 	}
 
-	next.UpdatedAt = now.UTC()
+	ts := now.UTC()
+	if !ts.After(e.UpdatedAt) {
+		ts = e.UpdatedAt.Add(time.Microsecond)
+	}
+	next.UpdatedAt = ts
 	*e = next
 	return nil
 }

@@ -138,6 +138,7 @@ func (h *Handler) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 		h.writeDomainError(w, err)
 		return
 	}
+	expectedUpdatedAt := ep.UpdatedAt
 
 	if err := ep.ApplyUpdate(domain.UpdateEndpointParams{
 		Name:             req.Name,
@@ -153,7 +154,7 @@ func (h *Handler) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.endpoints.UpdateEndpoint(r.Context(), ep); err != nil {
+	if err := h.endpoints.UpdateEndpoint(r.Context(), ep, expectedUpdatedAt); err != nil {
 		h.writeDomainError(w, err)
 		return
 	}

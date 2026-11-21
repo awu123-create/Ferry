@@ -13,6 +13,7 @@ const (
 	AttemptErrorNone    AttemptErrorKind = ""
 	AttemptErrorTimeout AttemptErrorKind = "TIMEOUT"
 	AttemptErrorNetwork AttemptErrorKind = "NETWORK"
+	AttemptErrorHTTP3xx AttemptErrorKind = "HTTP_3XX"
 	AttemptErrorHTTP4xx AttemptErrorKind = "HTTP_4XX"
 	AttemptErrorHTTP429 AttemptErrorKind = "HTTP_429"
 	AttemptErrorHTTP5xx AttemptErrorKind = "HTTP_5XX"

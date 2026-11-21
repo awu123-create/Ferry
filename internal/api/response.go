@@ -19,6 +19,7 @@ const (
 	errCodeFutureDeliveryUnsupported = "FUTURE_DELIVERY_UNSUPPORTED"
 	errCodeEndpointDisabled          = "ENDPOINT_DISABLED"
 	errCodeEndpointNotFound          = "ENDPOINT_NOT_FOUND"
+	errCodeEndpointConflict          = "ENDPOINT_CONFLICT"
 	errCodeTaskNotFound              = "TASK_NOT_FOUND"
 	errCodeIdempotencyConflict       = "IDEMPOTENCY_CONFLICT"
 	errCodeTaskNotCancellable        = "TASK_NOT_CANCELLABLE"
@@ -66,6 +67,8 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, err error) {
 		h.writeSentinelError(w, http.StatusBadRequest, errCodeEndpointDisabled, domain.ErrEndpointDisabled, err)
 	case errors.Is(err, domain.ErrEndpointNotFound):
 		h.writeSentinelError(w, http.StatusNotFound, errCodeEndpointNotFound, domain.ErrEndpointNotFound, err)
+	case errors.Is(err, domain.ErrEndpointConflict):
+		h.writeSentinelError(w, http.StatusConflict, errCodeEndpointConflict, domain.ErrEndpointConflict, err)
 	case errors.Is(err, domain.ErrTaskNotFound):
 		h.writeSentinelError(w, http.StatusNotFound, errCodeTaskNotFound, domain.ErrTaskNotFound, err)
 	case errors.Is(err, domain.ErrIdempotencyConflict):

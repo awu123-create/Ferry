@@ -19,7 +19,8 @@ import (
 )
 
 type fakeEndpointStore struct {
-	items map[uuid.UUID]domain.Endpoint
+	items          map[uuid.UUID]domain.Endpoint
+	onBeforeUpdate func(id uuid.UUID)
 }
 
 func (s *fakeEndpointStore) CreateEndpoint(_ context.Context, ep domain.Endpoint) error {
@@ -43,9 +44,16 @@ func (s *fakeEndpointStore) ListEndpoints(_ context.Context) ([]domain.Endpoint,
 	return out, nil
 }
 
-func (s *fakeEndpointStore) UpdateEndpoint(_ context.Context, ep domain.Endpoint) error {
-	if _, ok := s.items[ep.ID]; !ok {
+func (s *fakeEndpointStore) UpdateEndpoint(_ context.Context, ep domain.Endpoint, expectedUpdatedAt time.Time) error {
+	if s.onBeforeUpdate != nil {
+		s.onBeforeUpdate(ep.ID)
+	}
+	existing, ok := s.items[ep.ID]
+	if !ok {
 		return domain.ErrEndpointNotFound
+	}
+	if !existing.UpdatedAt.Equal(expectedUpdatedAt) {
+		return domain.ErrEndpointConflict
 	}
 	s.items[ep.ID] = ep
 	return nil
@@ -75,7 +83,7 @@ func (s *fakeTaskStore) CreateTaskIdempotent(_ context.Context, task domain.Task
 	key := taskKey{endpointID: task.EndpointID, idemKey: task.IdempotencyKey}
 	if existingID, exists := s.byKey[key]; exists {
 		existing := s.byID[existingID]
-		if err := existing.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256); err != nil {
+		if err := existing.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256, task.Headers); err != nil {
 			return domain.CreateTaskResult{}, err
 		}
 		return domain.CreateTaskResult{Task: existing, Created: false}, nil
@@ -188,6 +196,23 @@ func TestEndpointsLifecycleAndSecretRedaction(t *testing.T) {
 	if getRec.Code != http.StatusOK {
 		t.Fatalf("expected 200 OK on get, got %d", getRec.Code)
 	}
+
+	// 模拟读后并发更新：乐观锁冲突应返回 409 ENDPOINT_CONFLICT，不覆盖已有状态。
+	store.onBeforeUpdate = func(id uuid.UUID) {
+		cur := store.items[id]
+		cur.RateLimitQPS = 99
+		cur.UpdatedAt = cur.UpdatedAt.Add(time.Second)
+		store.items[id] = cur
+	}
+	conflictPatchReq := httptest.NewRequestWithContext(ctx, http.MethodPatch, "/v1/endpoints/"+created.ID.String(), bytes.NewReader([]byte(`{"enabled":true}`)))
+	conflictPatchRec := httptest.NewRecorder()
+	h.ServeHTTP(conflictPatchRec, conflictPatchReq)
+	if conflictPatchRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on concurrent endpoint update, got %d: %s", conflictPatchRec.Code, conflictPatchRec.Body.String())
+	}
+	if store.items[created.ID].Enabled || store.items[created.ID].RateLimitQPS != 99 {
+		t.Fatalf("expected concurrent change preserved, got %+v", store.items[created.ID])
+	}
 }
 
 func TestReadinessAndTaskCreateIdempotency(t *testing.T) {
@@ -263,6 +288,26 @@ func TestReadinessAndTaskCreateIdempotency(t *testing.T) {
 	h.ServeHTTP(conflictRec, conflictReq)
 	if conflictRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 Conflict on payload mismatch, got %d: %s", conflictRec.Code, conflictRec.Body.String())
+	}
+
+	// 同键同载荷但自定义 headers 不同时返回 409 Conflict。
+	diffHdrBody := []byte(`{"endpoint_id":"` + ep.ID.String() + `","payload":` + rawPayload + `,"headers":{"X-Env":"staging"}}`)
+	diffHdrReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks", bytes.NewReader(diffHdrBody))
+	diffHdrReq.Header.Set("Idempotency-Key", "k-1")
+	diffHdrRec := httptest.NewRecorder()
+	h.ServeHTTP(diffHdrRec, diffHdrReq)
+	if diffHdrRec.Code != http.StatusConflict {
+		t.Fatalf("expected 409 Conflict on header mismatch, got %d: %s", diffHdrRec.Code, diffHdrRec.Body.String())
+	}
+
+	// 非法自定义 header 名在入口直接返回 400 Bad Request。
+	badHdrBody := []byte(`{"endpoint_id":"` + ep.ID.String() + `","payload":{"ok":1},"headers":{"Bad Header":"v"}}`)
+	badHdrReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks", bytes.NewReader(badHdrBody))
+	badHdrReq.Header.Set("Idempotency-Key", "k-bad-hdr")
+	badHdrRec := httptest.NewRecorder()
+	h.ServeHTTP(badHdrRec, badHdrReq)
+	if badHdrRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid header name, got %d: %s", badHdrRec.Code, badHdrRec.Body.String())
 	}
 
 	// 未来 deliver_at 在 Milestone 1 应返回 400 Bad Request。

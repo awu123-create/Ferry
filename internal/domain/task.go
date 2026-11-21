@@ -17,6 +17,8 @@ const (
 	// MinTaskMaxAttempts 与 MaxTaskMaxAttempts 定义 Task.MaxAttempts 的合法闭区间（与数据库 CHECK 约束一致）。
 	MinTaskMaxAttempts = 1
 	MaxTaskMaxAttempts = 20
+	// EarlyArrivalClockSkewTolerance 容忍跨机器间小幅时钟偏差，避免刚创建的立即任务被 Worker 误判为早到。
+	EarlyArrivalClockSkewTolerance = 1 * time.Second
 )
 
 // TaskStatus 表示 Task 持久化生命周期的五种状态。
@@ -61,6 +63,8 @@ const (
 	DeadLetterReasonEndpointDisabled = "ENDPOINT_DISABLED"
 	// DeadLetterReasonNonRetryable4xx 记录因遭遇不可重试 4xx 契约错误而转入死信的原因码。
 	DeadLetterReasonNonRetryable4xx = "NON_RETRYABLE_4XX"
+	// DeadLetterReasonUnexpectedRedirect 记录因下游返回 3xx 重定向（不自动跟随）而转入死信的原因码。
+	DeadLetterReasonUnexpectedRedirect = "UNEXPECTED_REDIRECT"
 	// DeadLetterReasonMaxAttemptsExhausted 记录因耗尽最大尝试次数而转入死信的原因码。
 	DeadLetterReasonMaxAttemptsExhausted = "MAX_ATTEMPTS_EXHAUSTED"
 )
@@ -155,6 +159,10 @@ func NewTask(params NewTaskParams) (Task, error) {
 		return Task{}, NewValidationError("max_attempts", fmt.Sprintf("must be between %d and %d", MinTaskMaxAttempts, MaxTaskMaxAttempts))
 	}
 
+	if err := validateTaskHeaders(params.Headers); err != nil {
+		return Task{}, err
+	}
+
 	now := params.Now.UTC()
 	nextRunAt := now
 	if params.DeliverAt != nil {
@@ -175,7 +183,11 @@ func NewTask(params NewTaskParams) (Task, error) {
 		if params.DefaultWindow <= 0 {
 			return Task{}, NewValidationError("default_window", "must be > 0")
 		}
-		deadlineAt = nextRunAt.Add(params.DefaultWindow)
+		deadlineBase := nextRunAt
+		if deadlineBase.Before(now) {
+			deadlineBase = now
+		}
+		deadlineAt = deadlineBase.Add(params.DefaultWindow)
 	}
 
 	id, err := uuid.NewV7()
@@ -209,14 +221,14 @@ func NewTask(params NewTaskParams) (Task, error) {
 // VerifyIdempotentReplay 校验重复提交的请求是否与已持久化 Task 的幂等快照一致。
 //
 // 契约要求（ADR-0004 & ADR-0008）：
-//   - 校验 EndpointID 与 IdempotencyKey 匹配，并比对 PayloadSHA256。
+//   - 校验 EndpointID 与 IdempotencyKey 匹配，并同时比对 PayloadSHA256 与自定义 Headers。
 //   - 完全一致时返回 nil（调用方返回 200 OK 与原 Task）。
-//   - PayloadSHA256 不一致时返回 ErrIdempotencyConflict（调用方返回 409 Conflict）。
-func (t Task) VerifyIdempotentReplay(endpointID uuid.UUID, idempotencyKey, payloadSHA256 string) error {
+//   - PayloadSHA256 或 Headers 不一致时返回 ErrIdempotencyConflict（调用方返回 409 Conflict）。
+func (t Task) VerifyIdempotentReplay(endpointID uuid.UUID, idempotencyKey, payloadSHA256 string, headers map[string]string) error {
 	if t.EndpointID != endpointID || t.IdempotencyKey != strings.TrimSpace(idempotencyKey) {
 		return NewValidationError("idempotency_key", "does not match existing task")
 	}
-	if t.PayloadSHA256 != payloadSHA256 {
+	if t.PayloadSHA256 != payloadSHA256 || !maps.Equal(t.Headers, headers) {
 		return ErrIdempotencyConflict
 	}
 	return nil
@@ -226,7 +238,7 @@ func (t Task) VerifyIdempotentReplay(endpointID uuid.UUID, idempotencyKey, paylo
 //
 // 契约要求（ADR-0007 & ADR-0008）：
 //   - 若 t.Status.IsTerminal()：返回 PreDeliveryDecision{AlreadyFinal: true}, nil。
-//   - 若 now.Before(t.NextRunAt)：返回 PreDeliveryDecision{EarlyArrival: true}, nil。
+//   - 若 now + EarlyArrivalClockSkewTolerance 早于 t.NextRunAt：返回 PreDeliveryDecision{EarlyArrival: true}, nil。
 //   - 若 !ep.Enabled：返回 PreDeliveryDecision{DeadLetterCode: DeadLetterReasonEndpointDisabled}, nil。
 //   - 若 !now.Before(t.DeadlineAt)：返回 PreDeliveryDecision{DeadLetterCode: DeadLetterReasonDeadlineExceeded}, nil。
 //   - 其余情况返回 PreDeliveryDecision{ShouldDeliver: true}, nil。
@@ -236,7 +248,7 @@ func (t Task) EvaluatePreDelivery(ep Endpoint, now time.Time) (PreDeliveryDecisi
 	switch {
 	case t.Status.IsTerminal():
 		return PreDeliveryDecision{AlreadyFinal: true}, nil
-	case ts.Before(t.NextRunAt):
+	case ts.Add(EarlyArrivalClockSkewTolerance).Before(t.NextRunAt):
 		return PreDeliveryDecision{EarlyArrival: true}, nil
 	case !ep.Enabled:
 		return PreDeliveryDecision{DeadLetterCode: DeadLetterReasonEndpointDisabled}, nil
@@ -288,6 +300,10 @@ func (t *Task) RecordOutcome(result DeliveryResult, now time.Time) (OutcomeTrans
 		transition.LastError = ""
 		transition.CompletedAt = &ts
 		transition.CircuitSuccess = true
+	case AttemptErrorHTTP3xx:
+		transition.NextStatus = TaskStatusDeadLetter
+		transition.LastError = DeadLetterReasonUnexpectedRedirect
+		transition.CompletedAt = &ts
 	case AttemptErrorHTTP4xx:
 		transition.NextStatus = TaskStatusDeadLetter
 		transition.LastError = DeadLetterReasonNonRetryable4xx
@@ -338,4 +354,47 @@ func (t *Task) Cancel(now time.Time) error {
 func ComputePayloadSHA256(rawPayload []byte) string {
 	sum := sha256.Sum256(rawPayload)
 	return hex.EncodeToString(sum[:])
+}
+
+func validateTaskHeaders(headers map[string]string) error {
+	for name, val := range headers {
+		if !isValidHeaderName(name) {
+			return NewValidationError("headers", fmt.Sprintf("invalid header name %q", name))
+		}
+		if !isValidHeaderValue(val) {
+			return NewValidationError("headers", fmt.Sprintf("invalid header value for %q", name))
+		}
+	}
+	return nil
+}
+
+// isValidHeaderName 按 RFC 7230 field-name (tchar) 规范校验 HTTP Header 名称。
+func isValidHeaderName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		switch c {
+		case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// isValidHeaderValue 拒绝含 CR/LF/NUL 等非法控制字符的 HTTP Header 值，防止请求头注入。
+func isValidHeaderValue(val string) bool {
+	for i := range len(val) {
+		c := val[i]
+		if c == '\r' || c == '\n' || c == 0 || (c < 0x20 && c != '\t') || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }

@@ -13,7 +13,7 @@ import (
 
 const (
 	defaultMaxPayloadBytes = 1 << 20
-	defaultCancelLockTTL   = 60 * time.Second
+	defaultCancelLockTTL   = 10 * time.Second
 	readinessTimeout       = 2 * time.Second
 )
 

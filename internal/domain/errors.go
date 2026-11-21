@@ -12,6 +12,8 @@ var (
 	ErrEndpointNotFound = errors.New("endpoint not found")
 	// ErrEndpointDisabled 表示目标 Endpoint 当前处于禁用状态。
 	ErrEndpointDisabled = errors.New("endpoint is disabled")
+	// ErrEndpointConflict 表示 Endpoint 在更新前已被其他并发请求修改。
+	ErrEndpointConflict = errors.New("endpoint was modified concurrently")
 	// ErrTaskNotFound 表示请求的 Task 不存在。
 	ErrTaskNotFound = errors.New("task not found")
 	// ErrIdempotencyConflict 表示同一个 Idempotency Key 被不同载荷重复使用。

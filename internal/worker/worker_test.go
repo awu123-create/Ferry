@@ -143,6 +143,9 @@ func (r *fakeEndpointReader) GetEndpoint(_ context.Context, id uuid.UUID) (domai
 type fakeLocker struct {
 	mu           sync.Mutex
 	held         map[uuid.UUID]string
+	acquireTTL   time.Duration
+	extendTTL    time.Duration
+	extendCount  int
 	releaseCount int
 }
 
@@ -150,7 +153,7 @@ func newFakeLocker() *fakeLocker {
 	return &fakeLocker{held: make(map[uuid.UUID]string)}
 }
 
-func (l *fakeLocker) AcquireExecutionLock(_ context.Context, taskID uuid.UUID, _ time.Duration) (string, bool, error) {
+func (l *fakeLocker) AcquireExecutionLock(_ context.Context, taskID uuid.UUID, ttl time.Duration) (string, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if _, exists := l.held[taskID]; exists {
@@ -158,7 +161,20 @@ func (l *fakeLocker) AcquireExecutionLock(_ context.Context, taskID uuid.UUID, _
 	}
 	token := uuid.NewString()
 	l.held[taskID] = token
+	l.acquireTTL = ttl
 	return token, true, nil
+}
+
+func (l *fakeLocker) ExtendExecutionLock(_ context.Context, taskID uuid.UUID, token string, ttl time.Duration) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	current, ok := l.held[taskID]
+	if !ok || current != token {
+		return false, nil
+	}
+	l.extendTTL = ttl
+	l.extendCount++
+	return true, nil
 }
 
 func (l *fakeLocker) ReleaseExecutionLock(_ context.Context, taskID uuid.UUID, token string) error {
@@ -250,9 +266,13 @@ func TestProcessDeliverySuccessLockOrderingAndAudit(t *testing.T) {
 		t.Fatalf("ProcessDelivery failed: %v", err)
 	}
 
-	// 验证锁在 PG 写库时尚未释放、ProcessDelivery 返回后才释放。
+	// 验证锁在 PG 写库时尚未释放、ProcessDelivery 返回后才释放，且按 Endpoint 实际超时续期。
 	if !tasks.lockHeldAtSave {
 		t.Fatal("expected execution lock to remain held while SaveDeliveryOutcome executes")
+	}
+	wantExtendTTL := time.Duration(ep.TimeoutMs)*time.Millisecond + w.cfg.LockGrace
+	if locker.acquireTTL != initialExecutionLockTTL || locker.extendCount != 1 || locker.extendTTL != wantExtendTTL {
+		t.Fatalf("unexpected lock TTLs: acquire=%v extend=%v (want %v) count=%d", locker.acquireTTL, locker.extendTTL, wantExtendTTL, locker.extendCount)
 	}
 	if locker.isHeld(task.ID) || locker.releaseCount != 1 {
 		t.Fatalf("expected execution lock released after commit, held=%v releases=%d", locker.isHeld(task.ID), locker.releaseCount)

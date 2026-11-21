@@ -14,7 +14,7 @@ type EndpointStore interface {
 	CreateEndpoint(ctx context.Context, ep domain.Endpoint) error
 	GetEndpoint(ctx context.Context, id uuid.UUID) (domain.Endpoint, error)
 	ListEndpoints(ctx context.Context) ([]domain.Endpoint, error)
-	UpdateEndpoint(ctx context.Context, ep domain.Endpoint) error
+	UpdateEndpoint(ctx context.Context, ep domain.Endpoint, expectedUpdatedAt time.Time) error
 }
 
 // TaskStore 定义 HTTP 控制面对 Task 所需的持久化操作。

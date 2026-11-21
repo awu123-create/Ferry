@@ -133,3 +133,58 @@ func TestSenderStatusClassificationTimeoutAndSnippetTruncation(t *testing.T) {
 		t.Fatalf("unexpected 503 result: %+v", srvErrRes)
 	}
 }
+
+func TestSenderDoesNotFollowRedirectsAndTreats2xxBodyReadErrorAsSuccess(t *testing.T) {
+	var targetHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/redirect":
+			http.Redirect(w, r, "/target", http.StatusFound)
+		case "/target":
+			targetHits++
+			w.WriteHeader(http.StatusOK)
+		case "/200-truncated":
+			// 声明 100 字节响应体但写完状态码和部分字节后直接断开连接，模拟下游响应体截断。
+			w.Header().Set("Content-Length", "100")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok-part"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			if hj, ok := w.(http.Hijacker); ok {
+				if conn, _, err := hj.Hijack(); err == nil {
+					_ = conn.Close()
+				}
+			}
+		}
+	}))
+	defer srv.Close()
+
+	sender := NewSender(128)
+	id := uuid.New()
+
+	redirRes := sender.Send(context.Background(), domain.DeliveryRequest{
+		TaskID:      id,
+		EndpointURL: srv.URL + "/redirect",
+		AttemptNo:   1,
+		Timeout:     time.Second,
+		RawPayload:  []byte(`{"event":"paid"}`),
+	})
+	if redirRes.HTTPStatus != http.StatusFound || redirRes.ErrorKind != domain.AttemptErrorHTTP3xx {
+		t.Fatalf("expected 302 HTTP_3XX without following redirect, got %+v", redirRes)
+	}
+	if targetHits != 0 {
+		t.Fatalf("expected redirect target not called, got %d hits", targetHits)
+	}
+
+	truncRes := sender.Send(context.Background(), domain.DeliveryRequest{
+		TaskID:      id,
+		EndpointURL: srv.URL + "/200-truncated",
+		AttemptNo:   1,
+		Timeout:     time.Second,
+		RawPayload:  []byte(`{"event":"paid"}`),
+	})
+	if truncRes.HTTPStatus != http.StatusOK || truncRes.ErrorKind != domain.AttemptErrorNone {
+		t.Fatalf("expected 200 success even when body read fails, got %+v", truncRes)
+	}
+}

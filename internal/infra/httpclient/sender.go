@@ -46,7 +46,13 @@ func NewSender(maxSnippetBytes int) *Sender {
 		ExpectContinueTimeout: 1 * time.Second,
 	}
 	return &Sender{
-		client:          &http.Client{Transport: transport},
+		client: &http.Client{
+			Transport: transport,
+			// Webhook 投递不自动跟随 3xx 重定向，防止 301/302 将 POST 转为无载荷 GET 或绕过目标地址约束。
+			CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		maxSnippetBytes: maxSnippetBytes,
 	}
 }
@@ -85,19 +91,10 @@ func (s *Sender) Send(ctx context.Context, req domain.DeliveryRequest) domain.De
 		_ = resp.Body.Close()
 	}()
 
-	snippet, readErr := readBoundedSnippet(resp.Body, s.maxSnippetBytes)
+	// 响应片段仅作审计记录：一旦拿到下游 HTTP 状态码，即以状态码判定成败，
+	// 读取响应体出错不覆盖下游已返回的 2xx 成功或其他显式状态码分类。
+	snippet, _ := readBoundedSnippet(resp.Body, s.maxSnippetBytes)
 	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"), time.Now())
-
-	if readErr != nil {
-		return domain.DeliveryResult{
-			HTTPStatus:      resp.StatusCode,
-			DurationMs:      durationMs,
-			ErrorKind:       classifyTransportError(readErr),
-			ErrorMessage:    truncateText(readErr.Error(), maxErrorMsgBytes),
-			ResponseSnippet: snippet,
-			RetryAfter:      retryAfter,
-		}
-	}
 
 	kind, errMsg := classifyHTTPStatus(resp.StatusCode)
 	return domain.DeliveryResult{
@@ -158,13 +155,15 @@ func classifyTransportError(err error) domain.AttemptErrorKind {
 
 func classifyHTTPStatus(status int) (domain.AttemptErrorKind, string) {
 	switch {
-	case status >= 200 && status < 300:
+	case status >= http.StatusOK && status < http.StatusMultipleChoices:
 		return domain.AttemptErrorNone, ""
+	case status >= http.StatusMultipleChoices && status < http.StatusBadRequest:
+		return domain.AttemptErrorHTTP3xx, fmt.Sprintf("HTTP %d (redirect not followed)", status)
 	case status == http.StatusRequestTimeout:
 		return domain.AttemptErrorTimeout, http.StatusText(status)
 	case status == http.StatusTooManyRequests:
 		return domain.AttemptErrorHTTP429, http.StatusText(status)
-	case status >= 400 && status < 500:
+	case status >= http.StatusBadRequest && status < http.StatusInternalServerError:
 		return domain.AttemptErrorHTTP4xx, fmt.Sprintf("HTTP %d", status)
 	default:
 		return domain.AttemptErrorHTTP5xx, fmt.Sprintf("HTTP %d", status)
