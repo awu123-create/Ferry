@@ -54,7 +54,7 @@ func TestSenderPreservesRawBytesAndSignsPayload(t *testing.T) {
 		SentAt:     sentAt,
 	})
 
-	if res.ErrorKind != domain.AttemptErrorNone || res.HTTPStatus != 200 {
+	if res.ErrorKind != domain.AttemptErrorNone || res.HTTPStatus != http.StatusOK {
 		t.Fatalf("expected 200 success, got %+v", res)
 	}
 	if string(gotBody) != string(rawPayload) {

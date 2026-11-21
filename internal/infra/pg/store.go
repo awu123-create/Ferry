@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/pressly/goose/v3"
@@ -16,8 +17,10 @@ import (
 
 // Store 封装 PostgreSQL 持久化所需的 GORM 句柄与底层 sql.DB 连接池。
 type Store struct {
-	db    *gorm.DB
-	sqlDB *sql.DB
+	db         *gorm.DB
+	sqlDB      *sql.DB
+	listenMu   sync.Mutex
+	listenConn *sql.Conn
 }
 
 // Open 通过 GORM 连接 PostgreSQL、配置连接池参数并校验连通性。
@@ -68,9 +71,13 @@ func (s *Store) Ping(ctx context.Context) error {
 	return s.sqlDB.PingContext(ctx)
 }
 
-// Close 释放所有数据库连接池资源。
+// Close 释放专用监听连接与全部数据库连接池资源。
 func (s *Store) Close() error {
-	if s == nil || s.sqlDB == nil {
+	if s == nil {
+		return nil
+	}
+	s.closeOutboxListener()
+	if s.sqlDB == nil {
 		return nil
 	}
 	return s.sqlDB.Close()

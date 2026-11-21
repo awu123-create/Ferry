@@ -1,6 +1,11 @@
 package domain
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"maps"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,7 +47,7 @@ type OutcomeTransition struct {
 
 // NewTask 校验任务创建不变量并初始化 PENDING 状态的 Task 与对应的 OutboxItem。
 //
-// 契约要求（Milestone 1 核心逻辑，留待实现）：
+// 契约要求（Milestone 1 核心逻辑）：
 //  1. 要求 params.Endpoint.Enabled == true（否则返回 ErrEndpointDisabled）。
 //  2. 要求去除首尾空白后的 IdempotencyKey 非空（否则返回 NewValidationError("idempotency_key", ...)）。
 //  3. 要求 len(RawPayload) > 0 且满足合法 JSON 语法，但严禁重新序列化（原样保留原始字节切片）。
@@ -53,8 +58,78 @@ type OutcomeTransition struct {
 //  6. 为 Task.ID 生成 UUIDv7，通过 ComputePayloadSHA256(RawPayload) 计算 PayloadSHA256，
 //     设置 Status = TaskStatusPending、Attempt = 0、ReplayCount = 0，并返回配对的 OutboxItem。
 func NewTask(params NewTaskParams) (Task, OutboxItem, error) {
-	_ = params
-	return Task{}, OutboxItem{}, ErrNotImplemented
+	if !params.Endpoint.Enabled {
+		return Task{}, OutboxItem{}, ErrEndpointDisabled
+	}
+
+	idempotencyKey := strings.TrimSpace(params.IdempotencyKey)
+	if idempotencyKey == "" {
+		return Task{}, OutboxItem{}, NewValidationError("idempotency_key", "must not be empty")
+	}
+
+	if len(params.RawPayload) == 0 || !json.Valid(params.RawPayload) {
+		return Task{}, OutboxItem{}, NewValidationError("payload", "must be a non-empty valid JSON value")
+	}
+
+	if params.MaxAttempts < 1 || params.MaxAttempts > 20 {
+		return Task{}, OutboxItem{}, NewValidationError("max_attempts", "must be between 1 and 20")
+	}
+
+	now := params.Now.UTC()
+	nextRunAt := now
+	if params.DeliverAt != nil {
+		deliverAt := params.DeliverAt.UTC()
+		if deliverAt.After(now) {
+			return Task{}, OutboxItem{}, ErrFutureDeliveryUnsupported
+		}
+		nextRunAt = deliverAt
+	}
+
+	var deadlineAt time.Time
+	if params.DeadlineAt != nil {
+		deadlineAt = params.DeadlineAt.UTC()
+		if !deadlineAt.After(nextRunAt) || !deadlineAt.After(now) {
+			return Task{}, OutboxItem{}, NewValidationError("deadline_at", "must be after next_run_at and now")
+		}
+	} else {
+		if params.DefaultWindow <= 0 {
+			return Task{}, OutboxItem{}, NewValidationError("default_window", "must be > 0")
+		}
+		deadlineAt = nextRunAt.Add(params.DefaultWindow)
+	}
+
+	id, err := uuid.NewV7()
+	if err != nil {
+		return Task{}, OutboxItem{}, fmt.Errorf("generate task uuid: %w", err)
+	}
+
+	headers := make(map[string]string, len(params.Headers))
+	maps.Copy(headers, params.Headers)
+
+	task := Task{
+		ID:             id,
+		EndpointID:     params.Endpoint.ID,
+		IdempotencyKey: idempotencyKey,
+		Payload:        bytes.Clone(params.RawPayload),
+		PayloadSHA256:  ComputePayloadSHA256(params.RawPayload),
+		Headers:        headers,
+		Status:         TaskStatusPending,
+		Attempt:        0,
+		MaxAttempts:    params.MaxAttempts,
+		NextRunAt:      nextRunAt,
+		DeadlineAt:     deadlineAt,
+		ReplayCount:    0,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+
+	outboxItem := OutboxItem{
+		TaskID:    task.ID,
+		DeliverAt: task.NextRunAt,
+		CreatedAt: now,
+	}
+
+	return task, outboxItem, nil
 }
 
 // VerifyIdempotentReplay 校验重复提交的请求是否与已持久化 Task 的幂等快照一致。
@@ -64,10 +139,13 @@ func NewTask(params NewTaskParams) (Task, OutboxItem, error) {
 //   - 完全一致时返回 nil（调用方返回 200 OK 与原 Task）。
 //   - PayloadSHA256 不一致时返回 ErrIdempotencyConflict（调用方返回 409 Conflict）。
 func (t Task) VerifyIdempotentReplay(endpointID uuid.UUID, idempotencyKey, payloadSHA256 string) error {
-	_ = endpointID
-	_ = idempotencyKey
-	_ = payloadSHA256
-	return ErrNotImplemented
+	if t.EndpointID != endpointID || t.IdempotencyKey != strings.TrimSpace(idempotencyKey) {
+		return NewValidationError("idempotency_key", "does not match existing task")
+	}
+	if t.PayloadSHA256 != payloadSHA256 {
+		return ErrIdempotencyConflict
+	}
+	return nil
 }
 
 // EvaluatePreDelivery 在 Worker Step B 发起出站 HTTP 投递前执行前置守卫检查。
@@ -79,9 +157,20 @@ func (t Task) VerifyIdempotentReplay(endpointID uuid.UUID, idempotencyKey, paylo
 //   - 若 !now.Before(t.DeadlineAt)：返回 PreDeliveryDecision{DeadLetterCode: DeadLetterReasonDeadlineExceeded}, nil。
 //   - 其余情况返回 PreDeliveryDecision{ShouldDeliver: true}, nil。
 func (t Task) EvaluatePreDelivery(ep Endpoint, now time.Time) (PreDeliveryDecision, error) {
-	_ = ep
-	_ = now
-	return PreDeliveryDecision{}, ErrNotImplemented
+	ts := now.UTC()
+
+	switch {
+	case t.Status.IsTerminal():
+		return PreDeliveryDecision{AlreadyFinal: true}, nil
+	case ts.Before(t.NextRunAt):
+		return PreDeliveryDecision{EarlyArrival: true}, nil
+	case !ep.Enabled:
+		return PreDeliveryDecision{DeadLetterCode: DeadLetterReasonEndpointDisabled}, nil
+	case !ts.Before(t.DeadlineAt):
+		return PreDeliveryDecision{DeadLetterCode: DeadLetterReasonDeadlineExceeded}, nil
+	default:
+		return PreDeliveryDecision{ShouldDeliver: true}, nil
+	}
 }
 
 // RecordOutcome 对出站 DeliveryResult 进行分级，演进 Task 状态并生成只追加 DeliveryAttempt 记录。
@@ -96,9 +185,62 @@ func (t Task) EvaluatePreDelivery(ep Endpoint, now time.Time) (PreDeliveryDecisi
 //     当 Attempt >= MaxAttempts 时直接迁移至 DEAD_LETTER，设置 DeadLetterReasonMaxAttemptsExhausted
 //     与 CompletedAt = &now（Milestone 2 会扩展为指数退避 + Retry-After -> RETRYING）。
 func (t *Task) RecordOutcome(result DeliveryResult, now time.Time) (OutcomeTransition, error) {
-	_ = result
-	_ = now
-	return OutcomeTransition{}, ErrNotImplemented
+	if !t.Status.IsActive() {
+		return OutcomeTransition{}, NewValidationError("status", "task must be in an active state (PENDING or RETRYING) to record outcome")
+	}
+
+	ts := now.UTC()
+	t.Attempt++
+
+	transition := OutcomeTransition{
+		NextAttempt: t.Attempt,
+		NextRunAt:   t.NextRunAt,
+		Attempt: DeliveryAttempt{
+			TaskID:          t.ID,
+			ReplayCount:     t.ReplayCount,
+			AttemptNo:       t.Attempt,
+			HTTPStatus:      result.HTTPStatus,
+			DurationMs:      result.DurationMs,
+			ErrorKind:       result.ErrorKind,
+			ErrorMessage:    result.ErrorMessage,
+			ResponseSnippet: result.ResponseSnippet,
+			CreatedAt:       ts,
+		},
+	}
+
+	switch result.ErrorKind {
+	case AttemptErrorNone:
+		transition.NextStatus = TaskStatusSucceeded
+		transition.LastError = ""
+		transition.CompletedAt = &ts
+		transition.CircuitSuccess = true
+	case AttemptErrorHTTP4xx:
+		transition.NextStatus = TaskStatusDeadLetter
+		transition.LastError = DeadLetterReasonNonRetryable4xx
+		transition.CompletedAt = &ts
+	default:
+		transition.CircuitRetryable = true
+		switch {
+		case !ts.Before(t.DeadlineAt):
+			transition.NextStatus = TaskStatusDeadLetter
+			transition.LastError = DeadLetterReasonDeadlineExceeded
+			transition.CompletedAt = &ts
+		case t.Attempt >= t.MaxAttempts:
+			transition.NextStatus = TaskStatusDeadLetter
+			transition.LastError = DeadLetterReasonMaxAttemptsExhausted
+			transition.CompletedAt = &ts
+		default:
+			transition.NextStatus = TaskStatusRetrying
+			transition.LastError = result.ErrorMessage
+		}
+	}
+
+	t.Status = transition.NextStatus
+	t.LastError = transition.LastError
+	t.UpdatedAt = ts
+	t.CompletedAt = transition.CompletedAt
+
+	return transition, nil
 }
 
 // Cancel 将处于非终态（PENDING 或 RETRYING）的 Task 迁移为 CANCELLED。
@@ -107,6 +249,13 @@ func (t *Task) RecordOutcome(result DeliveryResult, now time.Time) (OutcomeTrans
 //   - 若 t.Status.IsTerminal()：返回 ErrTaskNotCancellable。
 //   - 设置 Status = TaskStatusCancelled、CompletedAt = &now、UpdatedAt = now.UTC()。
 func (t *Task) Cancel(now time.Time) error {
-	_ = now
-	return ErrNotImplemented
+	if t.Status.IsTerminal() {
+		return ErrTaskNotCancellable
+	}
+
+	ts := now.UTC()
+	t.Status = TaskStatusCancelled
+	t.CompletedAt = &ts
+	t.UpdatedAt = ts
+	return nil
 }

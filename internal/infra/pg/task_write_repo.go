@@ -2,9 +2,12 @@ package pg
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 
 	"github.com/awu123-create/ferry/internal/domain"
 )
@@ -27,10 +30,60 @@ import (
 //     调用 existing.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256)，
 //     一致则返回 CreateTaskResult{Task: existing, Created: false}，不一致返回 ErrIdempotencyConflict。
 func (s *Store) CreateTaskIdempotent(ctx context.Context, task domain.Task, outbox domain.OutboxItem) (domain.CreateTaskResult, error) {
-	_ = ctx
-	_ = task
-	_ = outbox
-	return domain.CreateTaskResult{}, domain.ErrNotImplemented
+	var result domain.CreateTaskResult
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		po := toTaskPO(task)
+		res := tx.Clauses(clause.OnConflict{
+			Columns: []clause.Column{
+				{Name: "endpoint_id"},
+				{Name: "idempotency_key"},
+			},
+			DoNothing: true,
+		}).Create(&po)
+		if res.Error != nil {
+			return fmt.Errorf("insert task: %w", res.Error)
+		}
+
+		switch res.RowsAffected {
+		case 1:
+			// 说明 task 成功创建了
+			outboxPO := toOutboxPO(outbox)
+			if err := tx.Create(&outboxPO).Error; err != nil {
+				return fmt.Errorf("insert outbox: %w", err)
+			}
+
+			result = domain.CreateTaskResult{
+				Task:    task,
+				Created: true,
+			}
+		case 0:
+			var existPO taskPO
+			if err := tx.Where("endpoint_id = ? AND idempotency_key = ?", po.EndpointID, po.IdempotencyKey).First(&existPO).Error; err != nil {
+				return fmt.Errorf("query existing idempotent task: %w", err)
+			}
+
+			exist, err := toDomainTask(existPO)
+			if err != nil {
+				return fmt.Errorf("decode existing task: %w", err)
+			}
+			if err := exist.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256); err != nil {
+				return err
+			}
+
+			result = domain.CreateTaskResult{
+				Task:    exist,
+				Created: false,
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return domain.CreateTaskResult{}, err
+	}
+	return result, nil
 }
 
 // SavePreDeliveryDeadLetter 在未发起任何 HTTP 请求前，使用复合乐观锁条件
@@ -48,13 +101,14 @@ func (s *Store) SavePreDeliveryDeadLetter(
 	reason string,
 	now time.Time,
 ) (bool, error) {
-	_ = ctx
-	_ = taskID
-	_ = expectedReplayCount
-	_ = expectedAttempt
-	_ = reason
-	_ = now
-	return false, domain.ErrNotImplemented
+	ts := now.UTC()
+	res := s.db.WithContext(ctx).Model(&taskPO{}).Where("id = ? AND replay_count = ? AND attempt = ? AND status IN ('PENDING', 'RETRYING')", taskID, expectedReplayCount, expectedAttempt).Updates(map[string]any{
+		"status":       string(domain.TaskStatusDeadLetter),
+		"last_error":   reason,
+		"completed_at": ts,
+		"updated_at":   ts,
+	})
+	return res.RowsAffected == 1, res.Error
 }
 
 // SaveDeliveryOutcome 在单次 PostgreSQL 事务中追加 DeliveryAttempt 审计流水，
@@ -74,12 +128,35 @@ func (s *Store) SaveDeliveryOutcome(
 	task domain.Task,
 	attempt domain.DeliveryAttempt,
 ) (bool, error) {
-	_ = ctx
-	_ = expectedReplayCount
-	_ = expectedAttempt
-	_ = task
-	_ = attempt
-	return false, domain.ErrNotImplemented
+	var applied bool
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		poAttempt := toDeliveryAttemptPO(attempt)
+		if err := tx.Create(&poAttempt).Error; err != nil {
+			return fmt.Errorf("insert delivery attempt: %w", err)
+		}
+
+		poTask := toTaskPO(task)
+		res := tx.Model(&taskPO{}).Where("id = ? AND replay_count = ? AND attempt = ? AND status IN ('PENDING','RETRYING')",
+			poTask.ID, expectedReplayCount, expectedAttempt).Updates(map[string]any{
+			"status":       poTask.Status,
+			"attempt":      poTask.Attempt,
+			"next_run_at":  poTask.NextRunAt,
+			"last_error":   poTask.LastError,
+			"completed_at": poTask.CompletedAt,
+			"updated_at":   poTask.UpdatedAt,
+		})
+		if res.Error != nil {
+			return fmt.Errorf("update task outcome: %w", res.Error)
+		}
+
+		applied = res.RowsAffected == 1
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return applied, nil
 }
 
 // CancelTask 在调用方已持有 Redis Execution Lock 的前提下，
@@ -92,8 +169,26 @@ func (s *Store) SaveDeliveryOutcome(
 //  3. 若 res.RowsAffected == 0，调用 s.GetTask(ctx, taskID)：不存在则返回 ErrTaskNotFound，
 //     已处于终态则返回 ErrTaskNotCancellable。
 func (s *Store) CancelTask(ctx context.Context, taskID uuid.UUID, now time.Time) (domain.Task, error) {
-	_ = ctx
-	_ = taskID
-	_ = now
-	return domain.Task{}, domain.ErrNotImplemented
+	ts := now.UTC()
+	res := s.db.WithContext(ctx).Model(&taskPO{}).Where("id = ? AND status IN ('PENDING', 'RETRYING')", taskID).Updates(map[string]any{
+		"status":       string(domain.TaskStatusCancelled),
+		"completed_at": ts,
+		"updated_at":   ts,
+	})
+	if res.Error != nil {
+		return domain.Task{}, fmt.Errorf("cancel task: %w", res.Error)
+	}
+
+	if res.RowsAffected == 1 {
+		return s.GetTask(ctx, taskID)
+	}
+
+	task, err := s.GetTask(ctx, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	if task.Status.IsTerminal() {
+		return domain.Task{}, domain.ErrTaskNotCancellable
+	}
+	return domain.Task{}, fmt.Errorf("cancel task %s: concurrent state transition (status=%s): %w", taskID, task.Status, domain.ErrTaskNotCancellable)
 }

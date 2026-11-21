@@ -2,9 +2,11 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/awu123-create/ferry/internal/domain"
@@ -58,40 +60,77 @@ func NewOutboxRelay(
 	}, nil
 }
 
-// Run 驱动立即通道 OutboxRelay 循环，直到 ctx 被取消。
-//
-// 契约要求（Milestone 1 核心逻辑，留待实现，见 ADR-0002 & ADR-0008）：
-//  1. 当 claimed >= r.cfg.BatchSize 时持续调用 r.RelayOnce(ctx) 排空积压的立即通道记录。
-//  2. 排空后阻塞等待下一次唤醒：优先监听 r.outbox.WaitForOutboxNotification(waitCtx)
-//     （由 PostgreSQL 触发器 notify_ferry_outbox 瞬时唤醒），并以 r.cfg.PollInterval（500ms）作为兜底定时。
-//  3. 遇到瞬时错误时记录日志并短暂退避，避免空转打爆数据库，收到 ctx.Done() 后返回 nil。
+// Run 驱动立即通道 OutboxRelay 循环，直到 ctx 被取消（ADR-0002 & ADR-0008）。
 func (r *OutboxRelay) Run(ctx context.Context) error {
 	if !r.hasAllDependencies() {
 		return fmt.Errorf("outbox relay is missing required dependencies")
 	}
 
-	r.log.Info(
-		"outbox relay core is not yet implemented; waiting for shutdown",
-		zap.Int("batch_size", r.cfg.BatchSize),
-		zap.Duration("poll_interval", r.cfg.PollInterval),
-		zap.Duration("batch_timeout", r.cfg.BatchTimeout),
-	)
-	<-ctx.Done()
-	return nil
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+
+		claimed, err := r.RelayOnce(ctx)
+		if err != nil {
+			select {
+			case <-ctx.Done():
+				return nil
+			default:
+				r.log.Error("outbox relay batch failed", zap.Error(err))
+			}
+			if !sleepOrCancel(ctx, r.cfg.PollInterval) {
+				return nil
+			}
+			continue
+		}
+
+		// 若本批拉满，立即继续搬运直至排空积压。
+		if claimed >= r.cfg.BatchSize {
+			continue
+		}
+
+		waitCtx, cancelWait := context.WithTimeout(ctx, r.cfg.PollInterval)
+		waitErr := r.outbox.WaitForOutboxNotification(waitCtx)
+		cancelWait()
+
+		if waitErr != nil && !errors.Is(waitErr, context.DeadlineExceeded) && !errors.Is(waitErr, context.Canceled) {
+			r.log.Warn("outbox notification wait failed; falling back to poll interval", zap.Error(waitErr))
+			if !sleepOrCancel(ctx, r.cfg.PollInterval) {
+				return nil
+			}
+		}
+	}
 }
 
-// RelayOnce 抢占并派发单批有界的立即到期 Outbox 记录。
-//
-// 契约要求（Milestone 1 核心逻辑，留待实现）：
-//  1. 使用 batchCtx, cancel := context.WithTimeout(ctx, r.cfg.BatchTimeout) 绑定单批事务 5s 硬超时，
-//     防止慢发布长期持锁阻塞 PostgreSQL Autovacuum。
-//  2. 调用 r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.cfg.BatchSize, dispatch)，
-//     在 dispatch 回调中提取每条 item.TaskID 并调用 r.publisher.PublishTaskIDs(txCtx, taskIDs)。
+// RelayOnce 抢占并派发单批有界的立即到期 Outbox 记录（绑定单批 5s 硬超时）。
 func (r *OutboxRelay) RelayOnce(ctx context.Context) (int, error) {
-	_ = ctx
-	return 0, domain.ErrNotImplemented
+	batchCtx, cancel := context.WithTimeout(ctx, r.cfg.BatchTimeout)
+	defer cancel()
+
+	return r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.cfg.BatchSize, func(txCtx context.Context, items []domain.OutboxItem) error {
+		taskIDs := make([]uuid.UUID, 0, len(items))
+		for _, item := range items {
+			taskIDs = append(taskIDs, item.TaskID)
+		}
+		return r.publisher.PublishTaskIDs(txCtx, taskIDs)
+	})
 }
 
 func (r *OutboxRelay) hasAllDependencies() bool {
 	return r.outbox != nil && r.publisher != nil
+}
+
+func sleepOrCancel(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }

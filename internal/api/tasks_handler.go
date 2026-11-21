@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	"github.com/awu123-create/ferry/internal/domain"
 )
@@ -226,40 +227,50 @@ func resolveIdempotencyKey(headerVal, bodyVal string) (string, error) {
 }
 
 // createTask 编排幂等 Task 与 Outbox 记录的原子创建流程。
-//
-// 契约要求（Milestone 1 核心逻辑，留待实现）：
-//  1. 调用 h.endpoints.GetEndpoint(ctx, input.EndpointID) 加载目标 Endpoint。
-//  2. 调用 domain.NewTask 构造领域对象 Task 与 OutboxItem：
-//     domain.NewTask(domain.NewTaskParams{
-//     Endpoint:       ep,
-//     IdempotencyKey: input.IdempotencyKey,
-//     RawPayload:     input.RawPayload,
-//     Headers:        input.Headers,
-//     DeliverAt:      input.DeliverAt,
-//     MaxAttempts:    input.MaxAttempts,
-//     DeadlineAt:     input.DeadlineAt,
-//     DefaultWindow:  h.cfg.DefaultTaskWindow,
-//     Now:            time.Now().UTC(),
-//     })
-//  3. 调用 h.tasks.CreateTaskIdempotent(ctx, task, outbox) 原子落盘并返回结果。
 func (h *Handler) createTask(ctx context.Context, input createTaskInput) (domain.CreateTaskResult, error) {
-	_ = ctx
-	_ = input
-	return domain.CreateTaskResult{}, domain.ErrNotImplemented
+	ep, err := h.endpoints.GetEndpoint(ctx, input.EndpointID)
+	if err != nil {
+		return domain.CreateTaskResult{}, err
+	}
+
+	task, outbox, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: input.IdempotencyKey,
+		RawPayload:     input.RawPayload,
+		Headers:        input.Headers,
+		DeliverAt:      input.DeliverAt,
+		MaxAttempts:    input.MaxAttempts,
+		DeadlineAt:     input.DeadlineAt,
+		DefaultWindow:  h.cfg.DefaultTaskWindow,
+		Now:            time.Now().UTC(),
+	})
+	if err != nil {
+		return domain.CreateTaskResult{}, err
+	}
+
+	return h.tasks.CreateTaskIdempotent(ctx, task, outbox)
 }
 
-// cancelTask 先抢占 Execution Lock，再在 PostgreSQL 中原子取消处于非终态的 Task。
-//
-// 契约要求（Milestone 1 核心逻辑，留待实现，见 ADR-0008 §3）：
-//  1. 通过 token, acquired, err := h.locker.AcquireExecutionLock(ctx, taskID, h.cfg.CancelLockTTL) 抢占执行锁。
-//  2. 若 !acquired：说明 Worker 正在执行投递，返回 domain.Task{}, domain.ErrTaskExecutionInFlight（409 Conflict）。
-//  3. 在 defer 中调用 h.locker.ReleaseExecutionLock(context.WithoutCancel(ctx), taskID, token) 验主释放锁。
-//  4. 调用 h.tasks.CancelTask(ctx, taskID, time.Now().UTC()) 并返回取消后的 Task。
+// cancelTask 先抢占 Execution Lock，再在 PostgreSQL 中原子取消处于非终态的 Task（ADR-0008 §3）。
 func (h *Handler) cancelTask(ctx context.Context, taskID uuid.UUID) (domain.Task, error) {
-	if h.locker == nil {
-		return domain.Task{}, domain.ErrNotImplemented
+	token, acquired, err := h.locker.AcquireExecutionLock(ctx, taskID, h.cfg.CancelLockTTL)
+	if err != nil {
+		return domain.Task{}, err
 	}
-	_ = ctx
-	_ = taskID
-	return domain.Task{}, domain.ErrNotImplemented
+	if !acquired {
+		return domain.Task{}, domain.ErrTaskExecutionInFlight
+	}
+	defer func() {
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if relErr := h.locker.ReleaseExecutionLock(releaseCtx, taskID, token); relErr != nil {
+			h.log.Warn(
+				"release execution lock after cancel failed",
+				zap.String("task_id", taskID.String()),
+				zap.Error(relErr),
+			)
+		}
+	}()
+
+	return h.tasks.CancelTask(ctx, taskID, time.Now().UTC())
 }

@@ -11,12 +11,14 @@ import (
 )
 
 type endpointPO struct {
-	ID               uuid.UUID `gorm:"column:id;type:uuid;primaryKey"`
-	Name             string    `gorm:"column:name;type:text;not null"`
-	TargetURL        string    `gorm:"column:target_url;type:text;not null"`
-	SigningSecret    string    `gorm:"column:signing_secret;type:text;not null;default:''"`
-	RateLimitQPS     float64   `gorm:"column:rate_limit_qps;type:double precision;not null"`
-	MaxConcurrency   int       `gorm:"column:max_concurrency;type:int;not null"`
+	ID             uuid.UUID `gorm:"column:id;type:uuid;primaryKey"`
+	Name           string    `gorm:"column:name;type:text;not null"`
+	TargetURL      string    `gorm:"column:target_url;type:text;not null"`
+	SigningSecret  string    `gorm:"column:signing_secret;type:text;not null;default:''"`
+	RateLimitQPS   float64   `gorm:"column:rate_limit_qps;type:double precision;not null"`
+	MaxConcurrency int       `gorm:"column:max_concurrency;type:int;not null"`
+
+	// CircuitThreshold 表示连续失败次数达到该阈值时触发熔断，后续投递尝试将立即返回 ErrCircuitOpen。
 	CircuitThreshold int       `gorm:"column:circuit_threshold;type:int;not null"`
 	TimeoutMs        int       `gorm:"column:timeout_ms;type:int;not null"`
 	Enabled          bool      `gorm:"column:enabled;type:boolean;not null"`
