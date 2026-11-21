@@ -1,8 +1,7 @@
 package api
 
 import (
-	"encoding/json"
-	"io"
+	"encoding/json/v2"
 	"net/http"
 	"time"
 
@@ -163,13 +162,5 @@ func (h *Handler) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, maxBytes int64, dst any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxBytes)
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(dst); err != nil {
-		return err
-	}
-	// 拒绝根 JSON 对象之后多余的尾随内容。
-	if err := dec.Decode(&struct{}{}); err != io.EOF {
-		return http.ErrBodyNotAllowed
-	}
-	return nil
+	return json.UnmarshalRead(r.Body, dst)
 }

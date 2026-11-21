@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"fmt"
 	"maps"
 	"strings"
@@ -151,7 +151,7 @@ func NewTask(params NewTaskParams) (Task, error) {
 		return Task{}, NewValidationError("idempotency_key", "must not be empty")
 	}
 
-	if len(params.RawPayload) == 0 || !json.Valid(params.RawPayload) {
+	if len(params.RawPayload) == 0 || !jsontext.Value(params.RawPayload).IsValid() {
 		return Task{}, NewValidationError("payload", "must be a non-empty valid JSON value")
 	}
 

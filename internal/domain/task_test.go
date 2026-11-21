@@ -152,3 +152,40 @@ func TestEvaluatePreDeliveryClockSkewToleranceAndRecordOutcome3xx(t *testing.T) 
 		t.Fatalf("unexpected 3xx transition: %+v", tr)
 	}
 }
+
+func TestNewTaskValidatesJSONPayloadStrictly(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	ep, err := NewEndpoint(NewEndpointParams{
+		Name:      "orders",
+		TargetURL: "http://localhost:8081/webhook",
+	}, now)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "empty", payload: nil},
+		{name: "broken_syntax", payload: []byte(`{"ok":`)},
+		{name: "duplicate_key", payload: []byte(`{"amount":100,"amount":9999}`)},
+		{name: "invalid_utf8", payload: []byte("{\"msg\":\"\xff\"}")},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewTask(NewTaskParams{
+				Endpoint:       ep,
+				IdempotencyKey: "bad-json-" + tc.name,
+				RawPayload:     tc.payload,
+				MaxAttempts:    1,
+				DefaultWindow:  time.Hour,
+				Now:            now,
+			})
+			if !errors.Is(err, ErrValidation) {
+				t.Fatalf("expected ErrValidation for %s, got %v", tc.name, err)
+			}
+		})
+	}
+}

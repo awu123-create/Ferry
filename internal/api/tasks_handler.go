@@ -2,7 +2,7 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
 	"net/http"
 	"strings"
 	"time"
@@ -18,7 +18,7 @@ const taskEnvelopeOverheadBytes = 64 << 10
 type createTaskRequest struct {
 	EndpointID     string            `json:"endpoint_id"`
 	IdempotencyKey string            `json:"idempotency_key,omitempty"`
-	Payload        json.RawMessage   `json:"payload"`
+	Payload        jsontext.Value    `json:"payload"`
 	Headers        map[string]string `json:"headers,omitempty"`
 	DeliverAt      *time.Time        `json:"deliver_at,omitempty"`
 	MaxAttempts    *int              `json:"max_attempts,omitempty"`
@@ -39,7 +39,7 @@ type taskResponse struct {
 	ID             uuid.UUID         `json:"id"`
 	EndpointID     uuid.UUID         `json:"endpoint_id"`
 	IdempotencyKey string            `json:"idempotency_key"`
-	Payload        json.RawMessage   `json:"payload"`
+	Payload        jsontext.Value    `json:"payload"`
 	PayloadSHA256  string            `json:"payload_sha256"`
 	Headers        map[string]string `json:"headers"`
 	Status         string            `json:"status"`
@@ -68,9 +68,9 @@ type deliveryAttemptResponse struct {
 }
 
 func toTaskResponse(task domain.Task) taskResponse {
-	rawPayload := json.RawMessage(task.Payload)
-	if !json.Valid(rawPayload) {
-		rawPayload = json.RawMessage("null")
+	rawPayload := jsontext.Value(task.Payload)
+	if !rawPayload.IsValid() {
+		rawPayload = jsontext.Value("null")
 	}
 	return taskResponse{
 		ID:             task.ID,
@@ -127,7 +127,7 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(req.Payload) == 0 || !json.Valid(req.Payload) {
+	if len(req.Payload) == 0 || !req.Payload.IsValid() {
 		h.writeDomainError(w, domain.NewValidationError("payload", "must be a non-empty valid JSON value"))
 		return
 	}

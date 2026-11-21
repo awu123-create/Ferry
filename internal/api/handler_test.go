@@ -3,7 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -451,4 +451,45 @@ func TestWriteDomainErrorSanitizesWrappedErrors(t *testing.T) {
 			t.Fatalf("unexpected internal error envelope: %+v", body)
 		}
 	})
+}
+
+func TestDecodeJSONBodyRejectsTrailingAndDuplicateKeys(t *testing.T) {
+	ctx := t.Context()
+	h, err := NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, newFakeTaskStore(), newFakeLocker(), nil, HandlerConfig{})
+	if err != nil {
+		t.Fatalf("NewHandler failed: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "trailing_object",
+			body: `{"name":"ep","target_url":"http://localhost:8081/webhook"}{}`,
+		},
+		{
+			name: "duplicate_key",
+			body: `{"name":"a","name":"b","target_url":"http://localhost:8081/webhook"}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/endpoints", strings.NewReader(tc.body))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 Bad Request, got %d: %s", rec.Code, rec.Body.String())
+			}
+			var env errorEnvelope
+			if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+				t.Fatalf("decode error envelope: %v", err)
+			}
+			if env.Error.Code != errCodeInvalidJSON {
+				t.Fatalf("expected %s, got %+v", errCodeInvalidJSON, env)
+			}
+		})
+	}
 }

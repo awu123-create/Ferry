@@ -2,7 +2,7 @@ package main
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -68,7 +68,7 @@ func TestChaosReceiverSignatureAndStats(t *testing.T) {
 	}
 
 	var stat taskDeliveryStat
-	if err := json.NewDecoder(statsResp.Body).Decode(&stat); err != nil {
+	if err := json.UnmarshalRead(statsResp.Body, &stat); err != nil {
 		t.Fatalf("decode stats: %v", err)
 	}
 	if stat.Count != 1 || !stat.SignatureChecked || !stat.SignatureValid {
