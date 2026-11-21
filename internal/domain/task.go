@@ -2,6 +2,8 @@ package domain
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"maps"
@@ -11,7 +13,85 @@ import (
 	"github.com/google/uuid"
 )
 
-// NewTaskParams 封装创建 Task 及其初始 Outbox 意图所需的校验后入参。
+const (
+	// MinTaskMaxAttempts 与 MaxTaskMaxAttempts 定义 Task.MaxAttempts 的合法闭区间（与数据库 CHECK 约束一致）。
+	MinTaskMaxAttempts = 1
+	MaxTaskMaxAttempts = 20
+)
+
+// TaskStatus 表示 Task 持久化生命周期的五种状态。
+type TaskStatus string
+
+const (
+	TaskStatusPending    TaskStatus = "PENDING"
+	TaskStatusRetrying   TaskStatus = "RETRYING"
+	TaskStatusSucceeded  TaskStatus = "SUCCEEDED"
+	TaskStatusDeadLetter TaskStatus = "DEAD_LETTER"
+	TaskStatusCancelled  TaskStatus = "CANCELLED"
+)
+
+// ParseTaskStatus 校验并将持久化的状态字符串解析为 TaskStatus。
+func ParseTaskStatus(raw string) (TaskStatus, error) {
+	switch TaskStatus(raw) {
+	case TaskStatusPending,
+		TaskStatusRetrying,
+		TaskStatusSucceeded,
+		TaskStatusDeadLetter,
+		TaskStatusCancelled:
+		return TaskStatus(raw), nil
+	default:
+		return "", fmt.Errorf("unknown task status %q", raw)
+	}
+}
+
+// IsTerminal 判断 Task 是否已进入终态。
+func (s TaskStatus) IsTerminal() bool {
+	return s == TaskStatusSucceeded || s == TaskStatusDeadLetter || s == TaskStatusCancelled
+}
+
+// IsActive 判断 Task 是否仍处于可调度或可取消的非终态。
+func (s TaskStatus) IsActive() bool {
+	return s == TaskStatusPending || s == TaskStatusRetrying
+}
+
+const (
+	// DeadLetterReasonDeadlineExceeded 记录因越过 DeadlineAt 截止时间而终止投递的死信原因码。
+	DeadLetterReasonDeadlineExceeded = "TTL_EXPIRED"
+	// DeadLetterReasonEndpointDisabled 记录因目标 Endpoint 已被禁用而终止投递的死信原因码。
+	DeadLetterReasonEndpointDisabled = "ENDPOINT_DISABLED"
+	// DeadLetterReasonNonRetryable4xx 记录因遭遇不可重试 4xx 契约错误而转入死信的原因码。
+	DeadLetterReasonNonRetryable4xx = "NON_RETRYABLE_4XX"
+	// DeadLetterReasonMaxAttemptsExhausted 记录因耗尽最大尝试次数而转入死信的原因码。
+	DeadLetterReasonMaxAttemptsExhausted = "MAX_ATTEMPTS_EXHAUSTED"
+)
+
+// Task 是表示单次可靠 HTTP POST 投递单元与生命周期的聚合根。
+type Task struct {
+	ID             uuid.UUID
+	EndpointID     uuid.UUID
+	IdempotencyKey string
+	Payload        []byte
+	PayloadSHA256  string
+	Headers        map[string]string
+	Status         TaskStatus
+	Attempt        int
+	MaxAttempts    int
+	NextRunAt      time.Time
+	DeadlineAt     time.Time
+	LastError      string
+	ReplayCount    int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	CompletedAt    *time.Time
+}
+
+// CreateTaskResult 表示任务创建结果以及本次提交是否新建了 Task 记录。
+type CreateTaskResult struct {
+	Task    Task
+	Created bool
+}
+
+// NewTaskParams 封装创建 Task 所需的校验后入参。
 type NewTaskParams struct {
 	Endpoint       Endpoint
 	IdempotencyKey string
@@ -45,7 +125,7 @@ type OutcomeTransition struct {
 	CircuitRetryable bool
 }
 
-// NewTask 校验任务创建不变量并初始化 PENDING 状态的 Task 与对应的 OutboxItem。
+// NewTask 校验任务创建不变量并初始化 PENDING 状态的 Task。
 //
 // 契约要求（Milestone 1 核心逻辑）：
 //  1. 要求 params.Endpoint.Enabled == true（否则返回 ErrEndpointDisabled）。
@@ -56,23 +136,23 @@ type OutcomeTransition struct {
 //  5. 要求 MaxAttempts 位于 [1, 20]；NextRunAt 默认取 DeliverAt（或 Now），
 //     DeadlineAt 为 nil 时默认取 NextRunAt + DefaultWindow（非 nil 时校验 DeadlineAt.After(NextRunAt)）。
 //  6. 为 Task.ID 生成 UUIDv7，通过 ComputePayloadSHA256(RawPayload) 计算 PayloadSHA256，
-//     设置 Status = TaskStatusPending、Attempt = 0、ReplayCount = 0，并返回配对的 OutboxItem。
-func NewTask(params NewTaskParams) (Task, OutboxItem, error) {
+//     设置 Status = TaskStatusPending、Attempt = 0、ReplayCount = 0。
+func NewTask(params NewTaskParams) (Task, error) {
 	if !params.Endpoint.Enabled {
-		return Task{}, OutboxItem{}, ErrEndpointDisabled
+		return Task{}, ErrEndpointDisabled
 	}
 
 	idempotencyKey := strings.TrimSpace(params.IdempotencyKey)
 	if idempotencyKey == "" {
-		return Task{}, OutboxItem{}, NewValidationError("idempotency_key", "must not be empty")
+		return Task{}, NewValidationError("idempotency_key", "must not be empty")
 	}
 
 	if len(params.RawPayload) == 0 || !json.Valid(params.RawPayload) {
-		return Task{}, OutboxItem{}, NewValidationError("payload", "must be a non-empty valid JSON value")
+		return Task{}, NewValidationError("payload", "must be a non-empty valid JSON value")
 	}
 
-	if params.MaxAttempts < 1 || params.MaxAttempts > 20 {
-		return Task{}, OutboxItem{}, NewValidationError("max_attempts", "must be between 1 and 20")
+	if params.MaxAttempts < MinTaskMaxAttempts || params.MaxAttempts > MaxTaskMaxAttempts {
+		return Task{}, NewValidationError("max_attempts", fmt.Sprintf("must be between %d and %d", MinTaskMaxAttempts, MaxTaskMaxAttempts))
 	}
 
 	now := params.Now.UTC()
@@ -80,7 +160,7 @@ func NewTask(params NewTaskParams) (Task, OutboxItem, error) {
 	if params.DeliverAt != nil {
 		deliverAt := params.DeliverAt.UTC()
 		if deliverAt.After(now) {
-			return Task{}, OutboxItem{}, ErrFutureDeliveryUnsupported
+			return Task{}, ErrFutureDeliveryUnsupported
 		}
 		nextRunAt = deliverAt
 	}
@@ -89,18 +169,18 @@ func NewTask(params NewTaskParams) (Task, OutboxItem, error) {
 	if params.DeadlineAt != nil {
 		deadlineAt = params.DeadlineAt.UTC()
 		if !deadlineAt.After(nextRunAt) || !deadlineAt.After(now) {
-			return Task{}, OutboxItem{}, NewValidationError("deadline_at", "must be after next_run_at and now")
+			return Task{}, NewValidationError("deadline_at", "must be after next_run_at and now")
 		}
 	} else {
 		if params.DefaultWindow <= 0 {
-			return Task{}, OutboxItem{}, NewValidationError("default_window", "must be > 0")
+			return Task{}, NewValidationError("default_window", "must be > 0")
 		}
 		deadlineAt = nextRunAt.Add(params.DefaultWindow)
 	}
 
 	id, err := uuid.NewV7()
 	if err != nil {
-		return Task{}, OutboxItem{}, fmt.Errorf("generate task uuid: %w", err)
+		return Task{}, fmt.Errorf("generate task uuid: %w", err)
 	}
 
 	headers := make(map[string]string, len(params.Headers))
@@ -123,13 +203,7 @@ func NewTask(params NewTaskParams) (Task, OutboxItem, error) {
 		UpdatedAt:      now,
 	}
 
-	outboxItem := OutboxItem{
-		TaskID:    task.ID,
-		DeliverAt: task.NextRunAt,
-		CreatedAt: now,
-	}
-
-	return task, outboxItem, nil
+	return task, nil
 }
 
 // VerifyIdempotentReplay 校验重复提交的请求是否与已持久化 Task 的幂等快照一致。
@@ -258,4 +332,10 @@ func (t *Task) Cancel(now time.Time) error {
 	t.CompletedAt = &ts
 	t.UpdatedAt = ts
 	return nil
+}
+
+// ComputePayloadSHA256 计算原始载荷字节切片的小写十六进制 SHA-256 摘要。
+func ComputePayloadSHA256(rawPayload []byte) string {
+	sum := sha256.Sum256(rawPayload)
+	return hex.EncodeToString(sum[:])
 }

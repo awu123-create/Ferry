@@ -6,8 +6,6 @@ import (
 )
 
 var (
-	// ErrNotImplemented 标记预留给开发者自行实现的 Milestone 1 核心方法。
-	ErrNotImplemented = errors.New("not implemented")
 	// ErrValidation 表示领域输入或业务不变量校验失败。
 	ErrValidation = errors.New("validation failed")
 	// ErrEndpointNotFound 表示请求的 Endpoint 不存在。

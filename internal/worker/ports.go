@@ -9,10 +9,9 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// ReadyStream 定义从 Kafka 拉取就绪 Task 票据并按连续完成水位提交 Offset 的接口。
+// ReadyStream 定义从就绪流拉取待投递任务句柄并按连续完成水位提交 Offset 的接口。
 type ReadyStream interface {
-	PollReady(ctx context.Context, maxRecords int) ([]domain.ReadyTicket, error)
-	Ack(ticket domain.ReadyTicket)
+	PollReady(ctx context.Context, maxRecords int) ([]domain.ReadyDelivery, error)
 	CommitCompleted(ctx context.Context) error
 }
 

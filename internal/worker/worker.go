@@ -15,8 +15,8 @@ import (
 )
 
 const (
-	// maxEndpointTimeout 对应 Endpoint.TimeoutMs 允许的最大值（60s），用于 Step A 抢锁时覆盖最坏执行时长。
-	maxEndpointTimeout   = 60 * time.Second
+	// maxEndpointTimeout 对应 Endpoint.TimeoutMs 允许的最大值，用于 Step A 抢锁时覆盖最坏执行时长。
+	maxEndpointTimeout   = time.Duration(domain.MaxEndpointTimeoutMs) * time.Millisecond
 	lockReleaseTimeout   = 5 * time.Second
 	pollErrorBackoff     = 200 * time.Millisecond
 	periodicCommitPeriod = 500 * time.Millisecond
@@ -138,7 +138,7 @@ pollLoop:
 			available = 1
 		}
 
-		tickets, err := w.stream.PollReady(ctx, available)
+		deliveries, err := w.stream.PollReady(ctx, available)
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -152,26 +152,26 @@ pollLoop:
 			continue
 		}
 
-		for _, ticket := range tickets {
+		for _, delivery := range deliveries {
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done():
-				// 停机已触发，尚未分发的票据不 Ack，退出后交由 Kafka 重平衡重投。
+				// 停机已触发，尚未分发的任务不 Ack，退出后交由底层重平衡重投。
 				break pollLoop
 			}
 
 			wg.Add(1)
-			go func(t domain.ReadyTicket) {
+			go func(d domain.ReadyDelivery) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				if procErr := w.ProcessTicket(drainCtx, t); procErr != nil {
+				if procErr := w.ProcessDelivery(drainCtx, d); procErr != nil {
 					w.log.Error(
-						"process task ticket failed",
-						zap.String("task_id", t.TaskID.String()),
+						"process ready delivery failed",
+						zap.String("task_id", d.TaskID.String()),
 						zap.Error(procErr),
 					)
 				}
-			}(ticket)
+			}(delivery)
 		}
 	}
 
@@ -213,40 +213,40 @@ pollLoop:
 	return nil
 }
 
-// ProcessTicket 对单条 Kafka ReadyTicket 执行 Step A~E 全流程处理（ADR-0007 & ADR-0008）。
-func (w *Worker) ProcessTicket(ctx context.Context, ticket domain.ReadyTicket) error {
-	ctx = logger.WithTaskID(ctx, ticket.TaskID)
+// ProcessDelivery 对单条就绪任务句柄执行 Step A~E 全流程处理（ADR-0007 & ADR-0008）。
+func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDelivery) error {
+	ctx = logger.WithTaskID(ctx, delivery.TaskID)
 
 	// Step A：先抢占 Redis 执行互斥锁（TTL 覆盖最长合法超时 + 保护余量），确保后续读取到最新任务快照。
 	lockTTL := maxEndpointTimeout + w.cfg.LockGrace
-	token, acquired, err := w.locker.AcquireExecutionLock(ctx, ticket.TaskID, lockTTL)
+	token, acquired, err := w.locker.AcquireExecutionLock(ctx, delivery.TaskID, lockTTL)
 	if err != nil {
 		return fmt.Errorf("acquire execution lock: %w", err)
 	}
 	if !acquired {
 		// 另一个 Worker 或 Cancel API 正持有该任务锁；Milestone 2 会在此处补充 ZADD NX 保底写入 ferry:delayed 后再 Ack。
-		w.log.Debug("execution lock held by another owner; skipping duplicate ticket", zap.String("task_id", ticket.TaskID.String()))
-		w.stream.Ack(ticket)
+		w.log.Debug("execution lock held by another owner; skipping duplicate delivery", zap.String("task_id", delivery.TaskID.String()))
+		ackDelivery(delivery)
 		return nil
 	}
 	defer func() {
 		// 必须在 PG 结算事务提交之后才通过 Lua 验主释放执行锁（ADR-0008 §3.1）。
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockReleaseTimeout)
 		defer cancel()
-		if relErr := w.locker.ReleaseExecutionLock(releaseCtx, ticket.TaskID, token); relErr != nil {
+		if relErr := w.locker.ReleaseExecutionLock(releaseCtx, delivery.TaskID, token); relErr != nil {
 			w.log.Warn(
 				"release execution lock failed",
-				zap.String("task_id", ticket.TaskID.String()),
+				zap.String("task_id", delivery.TaskID.String()),
 				zap.Error(relErr),
 			)
 		}
 	}()
 
 	// Step B：加载 Task 与 Endpoint 并执行前置守卫检查。
-	task, err := w.tasks.GetTask(ctx, ticket.TaskID)
+	task, err := w.tasks.GetTask(ctx, delivery.TaskID)
 	if errors.Is(err, domain.ErrTaskNotFound) {
-		w.log.Warn("task not found in postgres; acknowledging ticket", zap.String("task_id", ticket.TaskID.String()))
-		w.stream.Ack(ticket)
+		w.log.Warn("task not found in postgres; acknowledging delivery", zap.String("task_id", delivery.TaskID.String()))
+		ackDelivery(delivery)
 		return nil
 	}
 	if err != nil {
@@ -259,11 +259,11 @@ func (w *Worker) ProcessTicket(ctx context.Context, ticket domain.ReadyTicket) e
 	ep, err := w.endpoints.GetEndpoint(ctx, task.EndpointID)
 	if errors.Is(err, domain.ErrEndpointNotFound) {
 		w.log.Warn(
-			"endpoint not found for task; acknowledging ticket",
+			"endpoint not found for task; acknowledging delivery",
 			zap.String("task_id", task.ID.String()),
 			zap.String("endpoint_id", task.EndpointID.String()),
 		)
-		w.stream.Ack(ticket)
+		ackDelivery(delivery)
 		return nil
 	}
 	if err != nil {
@@ -277,14 +277,14 @@ func (w *Worker) ProcessTicket(ctx context.Context, ticket domain.ReadyTicket) e
 	}
 	if decision.AlreadyFinal || decision.EarlyArrival {
 		// Milestone 2 在 EarlyArrival 时会先保底 ZADD 回延迟池再 Ack。
-		w.stream.Ack(ticket)
+		ackDelivery(delivery)
 		return nil
 	}
 	if decision.DeadLetterCode != "" {
 		if _, err := w.tasks.SavePreDeliveryDeadLetter(ctx, task.ID, loadedReplay, loadedAttempt, decision.DeadLetterCode, now); err != nil {
 			return fmt.Errorf("save pre-delivery dead letter: %w", err)
 		}
-		w.stream.Ack(ticket)
+		ackDelivery(delivery)
 		return nil
 	}
 
@@ -319,8 +319,14 @@ func (w *Worker) ProcessTicket(ctx context.Context, ticket domain.ReadyTicket) e
 		)
 	}
 
-	w.stream.Ack(ticket)
+	ackDelivery(delivery)
 	return nil
+}
+
+func ackDelivery(delivery domain.ReadyDelivery) {
+	if delivery.Ack != nil {
+		delivery.Ack()
+	}
 }
 
 func (w *Worker) runPeriodicCommit(ctx context.Context, stop <-chan struct{}, stopped chan<- struct{}) {

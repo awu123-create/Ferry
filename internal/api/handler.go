@@ -2,8 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -60,7 +58,7 @@ func NewHandler(
 		log = zap.NewNop()
 	}
 	if cfg.DefaultMaxAttempts <= 0 {
-		cfg.DefaultMaxAttempts = 1
+		cfg.DefaultMaxAttempts = domain.MinTaskMaxAttempts
 	}
 	if cfg.DefaultTaskWindow <= 0 {
 		cfg.DefaultTaskWindow = 24 * time.Hour
@@ -119,59 +117,9 @@ func (h *Handler) handleReadyz(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := probe.Ping(ctx); err != nil {
 			h.log.Warn("readiness probe failed", zap.Error(err))
-			writeErrorJSON(w, http.StatusServiceUnavailable, "NOT_READY", "dependency readiness check failed")
+			writeErrorJSON(w, http.StatusServiceUnavailable, errCodeNotReady, errMsgNotReady)
 			return
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
-}
-
-type errorEnvelope struct {
-	Error errorDetail `json:"error"`
-}
-
-type errorDetail struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
-}
-
-func writeErrorJSON(w http.ResponseWriter, status int, code, message string) {
-	writeJSON(w, status, errorEnvelope{
-		Error: errorDetail{
-			Code:    code,
-			Message: message,
-		},
-	})
-}
-
-func (h *Handler) writeDomainError(w http.ResponseWriter, err error) {
-	switch {
-	case errors.Is(err, domain.ErrNotImplemented):
-		writeErrorJSON(w, http.StatusNotImplemented, "NOT_IMPLEMENTED", err.Error())
-	case errors.Is(err, domain.ErrValidation):
-		writeErrorJSON(w, http.StatusBadRequest, "VALIDATION_ERROR", err.Error())
-	case errors.Is(err, domain.ErrFutureDeliveryUnsupported):
-		writeErrorJSON(w, http.StatusBadRequest, "FUTURE_DELIVERY_UNSUPPORTED", err.Error())
-	case errors.Is(err, domain.ErrEndpointDisabled):
-		writeErrorJSON(w, http.StatusBadRequest, "ENDPOINT_DISABLED", err.Error())
-	case errors.Is(err, domain.ErrEndpointNotFound):
-		writeErrorJSON(w, http.StatusNotFound, "ENDPOINT_NOT_FOUND", err.Error())
-	case errors.Is(err, domain.ErrTaskNotFound):
-		writeErrorJSON(w, http.StatusNotFound, "TASK_NOT_FOUND", err.Error())
-	case errors.Is(err, domain.ErrIdempotencyConflict):
-		writeErrorJSON(w, http.StatusConflict, "IDEMPOTENCY_CONFLICT", err.Error())
-	case errors.Is(err, domain.ErrTaskNotCancellable):
-		writeErrorJSON(w, http.StatusConflict, "TASK_NOT_CANCELLABLE", err.Error())
-	case errors.Is(err, domain.ErrTaskExecutionInFlight):
-		writeErrorJSON(w, http.StatusConflict, "TASK_EXECUTION_IN_FLIGHT", err.Error())
-	default:
-		h.log.Error("unhandled api error", zap.Error(err))
-		writeErrorJSON(w, http.StatusInternalServerError, "INTERNAL_ERROR", "internal server error")
-	}
 }

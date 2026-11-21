@@ -19,7 +19,7 @@ type EndpointStore interface {
 
 // TaskStore 定义 HTTP 控制面对 Task 所需的持久化操作。
 type TaskStore interface {
-	CreateTaskIdempotent(ctx context.Context, task domain.Task, outbox domain.OutboxItem) (domain.CreateTaskResult, error)
+	CreateTaskIdempotent(ctx context.Context, task domain.Task) (domain.CreateTaskResult, error)
 	GetTask(ctx context.Context, id uuid.UUID) (domain.Task, error)
 	ListDeliveryAttempts(ctx context.Context, taskID uuid.UUID) ([]domain.DeliveryAttempt, error)
 	CancelTask(ctx context.Context, taskID uuid.UUID, now time.Time) (domain.Task, error)

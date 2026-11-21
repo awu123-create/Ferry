@@ -1,22 +1,16 @@
 package kafka
 
-import (
-	"testing"
-
-	"github.com/google/uuid"
-
-	"github.com/awu123-create/ferry/internal/domain"
-)
+import "testing"
 
 func TestOffsetTrackerContiguousWatermarks(t *testing.T) {
 	tracker := newOffsetTracker()
 	topic := "ferry.tasks.ready"
 
-	t10 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 0, Offset: 10, Epoch: 1}
-	t11 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 0, Offset: 11, Epoch: 1}
-	t12 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 0, Offset: 12, Epoch: 1}
+	t10 := offsetCoord{topic: topic, partition: 0, offset: 10, epoch: 1}
+	t11 := offsetCoord{topic: topic, partition: 0, offset: 11, epoch: 1}
+	t12 := offsetCoord{topic: topic, partition: 0, offset: 12, epoch: 1}
 
-	tracker.recordPolled([]domain.ReadyTicket{t10, t11, t12})
+	tracker.recordPolled([]offsetCoord{t10, t11, t12})
 
 	tracker.markDone(t11)
 	if got := tracker.takeCommittable(); len(got) != 0 {
@@ -37,8 +31,8 @@ func TestOffsetTrackerContiguousWatermarks(t *testing.T) {
 
 	// 模拟提交失败后，新水位继续推进应保留更高水位。
 	tracker.restoreCommittable(got)
-	t13 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 0, Offset: 13, Epoch: 2}
-	tracker.recordPolled([]domain.ReadyTicket{t13})
+	t13 := offsetCoord{topic: topic, partition: 0, offset: 13, epoch: 2}
+	tracker.recordPolled([]offsetCoord{t13})
 	tracker.markDone(t13)
 
 	next := tracker.takeCommittable()
@@ -51,9 +45,9 @@ func TestOffsetTrackerRevokePartitions(t *testing.T) {
 	tracker := newOffsetTracker()
 	topic := "ferry.tasks.ready"
 
-	p0 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 0, Offset: 5, Epoch: 1}
-	p1 := domain.ReadyTicket{TaskID: uuid.New(), Topic: topic, Partition: 1, Offset: 8, Epoch: 1}
-	tracker.recordPolled([]domain.ReadyTicket{p0, p1})
+	p0 := offsetCoord{topic: topic, partition: 0, offset: 5, epoch: 1}
+	p1 := offsetCoord{topic: topic, partition: 1, offset: 8, epoch: 1}
+	tracker.recordPolled([]offsetCoord{p0, p1})
 	tracker.markDone(p0)
 	tracker.markDone(p1)
 

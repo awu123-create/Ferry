@@ -54,8 +54,8 @@ func NewReadyReader(brokers []string, topic, groupID string) (*ReadyReader, erro
 	return reader, nil
 }
 
-// PollReady 从 Kafka 拉取最多 maxRecords 条票据，并将其偏移量登记到水位追踪器中。
-func (r *ReadyReader) PollReady(ctx context.Context, maxRecords int) ([]domain.ReadyTicket, error) {
+// PollReady 从 Kafka 拉取最多 maxRecords 条待投递任务句柄，并将对应偏移量登记到水位追踪器中。
+func (r *ReadyReader) PollReady(ctx context.Context, maxRecords int) ([]domain.ReadyDelivery, error) {
 	if maxRecords <= 0 {
 		maxRecords = 1
 	}
@@ -64,43 +64,45 @@ func (r *ReadyReader) PollReady(ctx context.Context, maxRecords int) ([]domain.R
 		return nil, err
 	}
 
-	var tickets []domain.ReadyTicket
-	var malformed []domain.ReadyTicket
+	var deliveries []domain.ReadyDelivery
+	var polled []offsetCoord
+	var malformed []offsetCoord
 	fetches.EachRecord(func(rec *kgo.Record) {
-		ticket := domain.ReadyTicket{
-			Topic:     rec.Topic,
-			Partition: rec.Partition,
-			Offset:    rec.Offset,
-			Epoch:     rec.LeaderEpoch,
+		coord := offsetCoord{
+			topic:     rec.Topic,
+			partition: rec.Partition,
+			offset:    rec.Offset,
+			epoch:     rec.LeaderEpoch,
 		}
+		polled = append(polled, coord)
+
 		taskID, err := parseTaskUUID(rec)
 		if err != nil {
-			malformed = append(malformed, ticket)
+			malformed = append(malformed, coord)
 			return
 		}
-		ticket.TaskID = taskID
-		tickets = append(tickets, ticket)
+		var ackOnce sync.Once
+		deliveries = append(deliveries, domain.ReadyDelivery{
+			TaskID: taskID,
+			Ack: func() {
+				ackOnce.Do(func() {
+					r.tracker.markDone(coord)
+				})
+			},
+		})
 	})
 
-	if len(tickets) > 0 || len(malformed) > 0 {
-		all := make([]domain.ReadyTicket, 0, len(tickets)+len(malformed))
-		all = append(all, tickets...)
-		all = append(all, malformed...)
-		r.tracker.recordPolled(all)
+	if len(polled) > 0 {
+		r.tracker.recordPolled(polled)
 		for _, bad := range malformed {
 			r.tracker.markDone(bad)
 		}
 	}
 
-	if err := fetches.Err0(); err != nil && len(tickets) == 0 {
+	if err := fetches.Err0(); err != nil && len(deliveries) == 0 {
 		return nil, err
 	}
-	return tickets, nil
-}
-
-// Ack 将指定票据标记为已完成；当同分区更早偏移量也全部完成后，提交水位随之推进。
-func (r *ReadyReader) Ack(ticket domain.ReadyTicket) {
-	r.tracker.markDone(ticket)
+	return deliveries, nil
 }
 
 // CommitCompleted 同步提交所有已分配分区上连续完成的 Offset 水位。
@@ -178,6 +180,13 @@ func parseTaskUUID(rec *kgo.Record) (uuid.UUID, error) {
 	return uuid.Nil, fmt.Errorf("empty task id record at %s[%d]@%d", rec.Topic, rec.Partition, rec.Offset)
 }
 
+type offsetCoord struct {
+	topic     string
+	partition int32
+	offset    int64
+	epoch     int32
+}
+
 type topicPartition struct {
 	topic     string
 	partition int32
@@ -202,41 +211,41 @@ func newOffsetTracker() *offsetTracker {
 	}
 }
 
-func (t *offsetTracker) recordPolled(tickets []domain.ReadyTicket) {
+func (t *offsetTracker) recordPolled(coords []offsetCoord) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	for _, ticket := range tickets {
-		tp := topicPartition{topic: ticket.Topic, partition: ticket.Partition}
+	for _, coord := range coords {
+		tp := topicPartition{topic: coord.topic, partition: coord.partition}
 		queue := t.inFlight[tp]
-		if n := len(queue); n > 0 && ticket.Offset <= queue[n-1].offset {
+		if n := len(queue); n > 0 && coord.offset <= queue[n-1].offset {
 			// 发生重平衡后，该分区可能从更早的未提交偏移量重新拉取，此处清理重叠或后续残留条目。
 			filtered := queue[:0]
 			for _, item := range queue {
-				if item.offset < ticket.Offset {
+				if item.offset < coord.offset {
 					filtered = append(filtered, item)
 				}
 			}
 			queue = filtered
 		}
 		t.inFlight[tp] = append(queue, trackedEntry{
-			offset: ticket.Offset,
-			epoch:  ticket.Epoch,
+			offset: coord.offset,
+			epoch:  coord.epoch,
 		})
 	}
 }
 
-func (t *offsetTracker) markDone(ticket domain.ReadyTicket) {
+func (t *offsetTracker) markDone(coord offsetCoord) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	tp := topicPartition{topic: ticket.Topic, partition: ticket.Partition}
+	tp := topicPartition{topic: coord.topic, partition: coord.partition}
 	queue := t.inFlight[tp]
 	if len(queue) == 0 {
 		return
 	}
 	for i := range queue {
-		if queue[i].offset == ticket.Offset {
+		if queue[i].offset == coord.offset {
 			queue[i].done = true
 			break
 		}
@@ -260,14 +269,14 @@ func (t *offsetTracker) markDone(ticket domain.ReadyTicket) {
 		t.inFlight[tp] = append([]trackedEntry(nil), remaining...)
 	}
 
-	partMap, ok := t.committable[ticket.Topic]
+	partMap, ok := t.committable[coord.topic]
 	if !ok {
 		partMap = make(map[int32]kgo.EpochOffset)
-		t.committable[ticket.Topic] = partMap
+		t.committable[coord.topic] = partMap
 	}
 	nextCommit := kgo.EpochOffset{Offset: lastDone.offset + 1, Epoch: lastDone.epoch}
-	if existing, exists := partMap[ticket.Partition]; !exists || existing.Offset < nextCommit.Offset {
-		partMap[ticket.Partition] = nextCommit
+	if existing, exists := partMap[coord.partition]; !exists || existing.Offset < nextCommit.Offset {
+		partMap[coord.partition] = nextCommit
 	}
 }
 

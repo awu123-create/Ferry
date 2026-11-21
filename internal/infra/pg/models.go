@@ -213,21 +213,3 @@ func toDomainDeliveryAttempt(po deliveryAttemptPO) domain.DeliveryAttempt {
 		CreatedAt:       po.CreatedAt.UTC(),
 	}
 }
-
-func toOutboxPO(item domain.OutboxItem) outboxPO {
-	return outboxPO{
-		ID:        item.ID,
-		TaskID:    item.TaskID,
-		DeliverAt: item.DeliverAt.UTC(),
-		CreatedAt: item.CreatedAt.UTC(),
-	}
-}
-
-func toDomainOutboxItem(po outboxPO) domain.OutboxItem {
-	return domain.OutboxItem{
-		ID:        po.ID,
-		TaskID:    po.TaskID,
-		DeliverAt: po.DeliverAt.UTC(),
-		CreatedAt: po.CreatedAt.UTC(),
-	}
-}

@@ -7,12 +7,11 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
-
-	"github.com/awu123-create/ferry/internal/domain"
 )
 
 const (
@@ -27,7 +26,7 @@ const (
 func (s *Store) ClaimAndDispatchImmediateOutbox(
 	ctx context.Context,
 	limit int,
-	dispatch func(ctx context.Context, items []domain.OutboxItem) error,
+	dispatch func(ctx context.Context, taskIDs []uuid.UUID) error,
 ) (int, error) {
 	if dispatch == nil {
 		return 0, fmt.Errorf("outbox dispatch callback must not be nil")
@@ -58,14 +57,14 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 			return nil
 		}
 
-		items := make([]domain.OutboxItem, 0, len(rows))
+		taskIDs := make([]uuid.UUID, 0, len(rows))
 		ids := make([]int64, 0, len(rows))
 		for _, row := range rows {
-			items = append(items, toDomainOutboxItem(row))
+			taskIDs = append(taskIDs, row.TaskID)
 			ids = append(ids, row.ID)
 		}
 
-		if err := dispatch(txCtx, items); err != nil {
+		if err := dispatch(txCtx, taskIDs); err != nil {
 			return err
 		}
 
@@ -73,7 +72,7 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 			return fmt.Errorf("delete dispatched outbox rows: %w", err)
 		}
 
-		claimed = len(items)
+		claimed = len(taskIDs)
 		return nil
 	})
 	if err != nil {

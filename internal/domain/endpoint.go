@@ -15,12 +15,14 @@ import (
 )
 
 const (
+	// MinEndpointTimeoutMs 与 MaxEndpointTimeoutMs 定义 Endpoint.TimeoutMs 的合法闭区间（与数据库 CHECK 约束一致）。
+	MinEndpointTimeoutMs = 100
+	MaxEndpointTimeoutMs = 60000
+
 	defaultRateLimitQPS     = 50.0
 	defaultMaxConcurrency   = 20
 	defaultCircuitThreshold = 30
 	defaultTimeoutMs        = 5000
-	minTimeoutMs            = 100
-	maxTimeoutMs            = 60000
 	signaturePrefix         = "sha256="
 )
 
@@ -249,8 +251,8 @@ func validateRateLimitQPS(qps float64) error {
 }
 
 func validateTimeoutMs(timeoutMs int) error {
-	if timeoutMs < minTimeoutMs || timeoutMs > maxTimeoutMs {
-		return NewValidationError("timeout_ms", "must be between 100 and 60000")
+	if timeoutMs < MinEndpointTimeoutMs || timeoutMs > MaxEndpointTimeoutMs {
+		return NewValidationError("timeout_ms", fmt.Sprintf("must be between %d and %d", MinEndpointTimeoutMs, MaxEndpointTimeoutMs))
 	}
 	return nil
 }

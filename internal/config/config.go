@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+const (
+	// minDefaultMaxAttempts 与 maxDefaultMaxAttempts 与 domain.MinTaskMaxAttempts/MaxTaskMaxAttempts 及 SQL CHECK 约束保持一致。
+	minDefaultMaxAttempts = 1
+	maxDefaultMaxAttempts = 20
+	minHTTPStatusCode     = 100
+	maxHTTPStatusCode     = 599
+)
+
 // ServerConfig 保存 ferry-server 的 12-Factor 环境变量配置。
 type ServerConfig struct {
 	HTTPAddr             string
@@ -147,8 +155,8 @@ func (c ServerConfig) validate() error {
 	if c.SlowSQLThreshold < 0 {
 		return fmt.Errorf("FERRY_SLOW_SQL_THRESHOLD must be >= 0")
 	}
-	if c.DefaultMaxAttempts < 1 || c.DefaultMaxAttempts > 20 {
-		return fmt.Errorf("FERRY_DEFAULT_MAX_ATTEMPTS must be between 1 and 20")
+	if c.DefaultMaxAttempts < minDefaultMaxAttempts || c.DefaultMaxAttempts > maxDefaultMaxAttempts {
+		return fmt.Errorf("FERRY_DEFAULT_MAX_ATTEMPTS must be between %d and %d", minDefaultMaxAttempts, maxDefaultMaxAttempts)
 	}
 	if c.DefaultTaskWindow <= 0 {
 		return fmt.Errorf("FERRY_DEFAULT_TASK_WINDOW must be > 0")
@@ -281,8 +289,8 @@ func LoadReceiverConfig() (ReceiverConfig, error) {
 	if strings.TrimSpace(cfg.HTTPAddr) == "" {
 		return ReceiverConfig{}, fmt.Errorf("FERRY_RECEIVER_ADDR must not be empty")
 	}
-	if cfg.DefaultStatus < 100 || cfg.DefaultStatus > 599 {
-		return ReceiverConfig{}, fmt.Errorf("FERRY_RECEIVER_DEFAULT_STATUS must be between 100 and 599")
+	if cfg.DefaultStatus < minHTTPStatusCode || cfg.DefaultStatus > maxHTTPStatusCode {
+		return ReceiverConfig{}, fmt.Errorf("FERRY_RECEIVER_DEFAULT_STATUS must be between %d and %d", minHTTPStatusCode, maxHTTPStatusCode)
 	}
 	if cfg.DefaultDelay < 0 {
 		return ReceiverConfig{}, fmt.Errorf("FERRY_RECEIVER_DEFAULT_DELAY must be >= 0")

@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
-
-	"github.com/awu123-create/ferry/internal/domain"
 )
 
 // OutboxRelayConfig 配置 OutboxRelay 的批量大小、兜底轮询周期与单批硬超时。
@@ -110,13 +107,7 @@ func (r *OutboxRelay) RelayOnce(ctx context.Context) (int, error) {
 	batchCtx, cancel := context.WithTimeout(ctx, r.cfg.BatchTimeout)
 	defer cancel()
 
-	return r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.cfg.BatchSize, func(txCtx context.Context, items []domain.OutboxItem) error {
-		taskIDs := make([]uuid.UUID, 0, len(items))
-		for _, item := range items {
-			taskIDs = append(taskIDs, item.TaskID)
-		}
-		return r.publisher.PublishTaskIDs(txCtx, taskIDs)
-	})
+	return r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.cfg.BatchSize, r.publisher.PublishTaskIDs)
 }
 
 func (r *OutboxRelay) hasAllDependencies() bool {

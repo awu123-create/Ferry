@@ -12,7 +12,7 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// CreateTaskIdempotent 在单次 PostgreSQL 事务中原子写入新 Task 与 OutboxItem；
+// CreateTaskIdempotent 在单次 PostgreSQL 事务中原子写入新 Task 与对应 outbox 行；
 // 若命中 (endpoint_id, idempotency_key) 唯一约束冲突，则回查已有记录并校验载荷 SHA-256。
 //
 // 实现指引（Milestone 1 核心逻辑，留待实现）：
@@ -23,13 +23,13 @@ import (
 //     DoNothing: true,
 //     }).Create(&po)
 //  3. 若 res.RowsAffected == 1：
-//     通过 toOutboxPO(outbox) 转换并写入 outbox（数据库触发器会自动通知 ferry_outbox），
+//     直接构造并写入 outboxPO（数据库触发器会自动通知 ferry_outbox），
 //     返回 CreateTaskResult{Task: task, Created: true}。
 //  4. 若 res.RowsAffected == 0：
 //     按 (endpoint_id, idempotency_key) 查询已有 taskPO 并转为领域模型，
 //     调用 existing.VerifyIdempotentReplay(task.EndpointID, task.IdempotencyKey, task.PayloadSHA256)，
 //     一致则返回 CreateTaskResult{Task: existing, Created: false}，不一致返回 ErrIdempotencyConflict。
-func (s *Store) CreateTaskIdempotent(ctx context.Context, task domain.Task, outbox domain.OutboxItem) (domain.CreateTaskResult, error) {
+func (s *Store) CreateTaskIdempotent(ctx context.Context, task domain.Task) (domain.CreateTaskResult, error) {
 	var result domain.CreateTaskResult
 
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -47,9 +47,13 @@ func (s *Store) CreateTaskIdempotent(ctx context.Context, task domain.Task, outb
 
 		switch res.RowsAffected {
 		case 1:
-			// 说明 task 成功创建了
-			outboxPO := toOutboxPO(outbox)
-			if err := tx.Create(&outboxPO).Error; err != nil {
+			// 说明 task 成功创建，在同事务内写入 outbox 行供 OutboxRelay 搬运。
+			outbox := outboxPO{
+				TaskID:    task.ID,
+				DeliverAt: task.NextRunAt.UTC(),
+				CreatedAt: task.CreatedAt.UTC(),
+			}
+			if err := tx.Create(&outbox).Error; err != nil {
 				return fmt.Errorf("insert outbox: %w", err)
 			}
 

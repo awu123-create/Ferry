@@ -66,7 +66,7 @@ func toEndpointResponse(ep domain.Endpoint) endpointResponse {
 func (h *Handler) handleCreateEndpoint(w http.ResponseWriter, r *http.Request) {
 	var req createEndpointRequest
 	if err := decodeJSONBody(w, r, 64<<10, &req); err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_JSON", err.Error())
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidJSON, err.Error())
 		return
 	}
 
@@ -108,7 +108,7 @@ func (h *Handler) handleListEndpoints(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_ENDPOINT_ID", "endpoint id must be a valid UUID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidEndpointID, "endpoint id must be a valid UUID")
 		return
 	}
 
@@ -123,13 +123,13 @@ func (h *Handler) handleGetEndpoint(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleUpdateEndpoint(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_ENDPOINT_ID", "endpoint id must be a valid UUID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidEndpointID, "endpoint id must be a valid UUID")
 		return
 	}
 
 	var req updateEndpointRequest
 	if err := decodeJSONBody(w, r, 64<<10, &req); err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_JSON", err.Error())
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidJSON, err.Error())
 		return
 	}
 

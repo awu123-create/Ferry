@@ -15,30 +15,35 @@ import (
 
 type fakeReadyStream struct {
 	mu          sync.Mutex
-	pollCh      chan []domain.ReadyTicket
-	acked       []domain.ReadyTicket
+	pollCh      chan []domain.ReadyDelivery
+	acked       []uuid.UUID
 	commitCount atomic.Int32
 }
 
 func newFakeReadyStream() *fakeReadyStream {
 	return &fakeReadyStream{
-		pollCh: make(chan []domain.ReadyTicket, 8),
+		pollCh: make(chan []domain.ReadyDelivery, 8),
 	}
 }
 
-func (s *fakeReadyStream) PollReady(ctx context.Context, _ int) ([]domain.ReadyTicket, error) {
+func (s *fakeReadyStream) newDelivery(taskID uuid.UUID) domain.ReadyDelivery {
+	return domain.ReadyDelivery{
+		TaskID: taskID,
+		Ack: func() {
+			s.mu.Lock()
+			s.acked = append(s.acked, taskID)
+			s.mu.Unlock()
+		},
+	}
+}
+
+func (s *fakeReadyStream) PollReady(ctx context.Context, _ int) ([]domain.ReadyDelivery, error) {
 	select {
-	case tickets := <-s.pollCh:
-		return tickets, nil
+	case deliveries := <-s.pollCh:
+		return deliveries, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-}
-
-func (s *fakeReadyStream) Ack(ticket domain.ReadyTicket) {
-	s.mu.Lock()
-	s.acked = append(s.acked, ticket)
-	s.mu.Unlock()
 }
 
 func (s *fakeReadyStream) CommitCompleted(_ context.Context) error {
@@ -197,7 +202,7 @@ func mustNewTaskFixture(t *testing.T, enabled bool) (domain.Endpoint, domain.Tas
 	if err != nil {
 		t.Fatalf("NewEndpoint failed: %v", err)
 	}
-	task, _, err := domain.NewTask(domain.NewTaskParams{
+	task, err := domain.NewTask(domain.NewTaskParams{
 		Endpoint:       ep,
 		IdempotencyKey: uuid.NewString(),
 		RawPayload:     []byte(`{"z": 1,  "a": "ok"}`),
@@ -218,7 +223,7 @@ func TestWorkerConstructorValidation(t *testing.T) {
 	}
 }
 
-func TestProcessTicketSuccessLockOrderingAndAudit(t *testing.T) {
+func TestProcessDeliverySuccessLockOrderingAndAudit(t *testing.T) {
 	ep, task := mustNewTaskFixture(t, true)
 	stream := newFakeReadyStream()
 	tasks := newFakeTaskStore()
@@ -240,12 +245,12 @@ func TestProcessTicketSuccessLockOrderingAndAudit(t *testing.T) {
 		t.Fatalf("NewWorker failed: %v", err)
 	}
 
-	ticket := domain.ReadyTicket{TaskID: task.ID, Topic: "ferry.tasks.ready", Partition: 0, Offset: 1}
-	if err := w.ProcessTicket(context.Background(), ticket); err != nil {
-		t.Fatalf("ProcessTicket failed: %v", err)
+	delivery := stream.newDelivery(task.ID)
+	if err := w.ProcessDelivery(context.Background(), delivery); err != nil {
+		t.Fatalf("ProcessDelivery failed: %v", err)
 	}
 
-	// 验证锁在 PG 写库时尚未释放、ProcessTicket 返回后才释放。
+	// 验证锁在 PG 写库时尚未释放、ProcessDelivery 返回后才释放。
 	if !tasks.lockHeldAtSave {
 		t.Fatal("expected execution lock to remain held while SaveDeliveryOutcome executes")
 	}
@@ -259,12 +264,12 @@ func TestProcessTicketSuccessLockOrderingAndAudit(t *testing.T) {
 	if saved.Status != domain.TaskStatusSucceeded || saved.Attempt != 1 || len(tasks.attempts) != 1 {
 		t.Fatalf("unexpected persisted task=%+v attempts=%d", saved, len(tasks.attempts))
 	}
-	if len(stream.acked) != 1 || stream.acked[0] != ticket {
-		t.Fatalf("expected ticket acknowledged, got %+v", stream.acked)
+	if len(stream.acked) != 1 || stream.acked[0] != task.ID {
+		t.Fatalf("expected delivery acknowledged, got %+v", stream.acked)
 	}
 }
 
-func TestProcessTicketNonRetryable4xxPreDisabledAndLockContention(t *testing.T) {
+func TestProcessDeliveryNonRetryable4xxPreDisabledAndLockContention(t *testing.T) {
 	t.Run("non-retryable 400 transitions directly to DEAD_LETTER", func(t *testing.T) {
 		ep, task := mustNewTaskFixture(t, true)
 		stream := newFakeReadyStream()
@@ -282,8 +287,8 @@ func TestProcessTicketNonRetryable4xxPreDisabledAndLockContention(t *testing.T) 
 		if err != nil {
 			t.Fatalf("NewWorker failed: %v", err)
 		}
-		if err := w.ProcessTicket(context.Background(), domain.ReadyTicket{TaskID: task.ID}); err != nil {
-			t.Fatalf("ProcessTicket failed: %v", err)
+		if err := w.ProcessDelivery(context.Background(), stream.newDelivery(task.ID)); err != nil {
+			t.Fatalf("ProcessDelivery failed: %v", err)
 		}
 		saved := tasks.tasks[task.ID]
 		if saved.Status != domain.TaskStatusDeadLetter || saved.Attempt != 1 || saved.LastError != domain.DeadLetterReasonNonRetryable4xx {
@@ -304,8 +309,8 @@ func TestProcessTicketNonRetryable4xxPreDisabledAndLockContention(t *testing.T) 
 		if err != nil {
 			t.Fatalf("NewWorker failed: %v", err)
 		}
-		if err := w.ProcessTicket(context.Background(), domain.ReadyTicket{TaskID: task.ID}); err != nil {
-			t.Fatalf("ProcessTicket failed: %v", err)
+		if err := w.ProcessDelivery(context.Background(), stream.newDelivery(task.ID)); err != nil {
+			t.Fatalf("ProcessDelivery failed: %v", err)
 		}
 		if sender.calls.Load() != 0 {
 			t.Fatalf("expected 0 HTTP calls for disabled endpoint, got %d", sender.calls.Load())
@@ -315,7 +320,7 @@ func TestProcessTicketNonRetryable4xxPreDisabledAndLockContention(t *testing.T) 
 		}
 	})
 
-	t.Run("lock contention skips delivery and acks duplicate ticket", func(t *testing.T) {
+	t.Run("lock contention skips delivery and acks duplicate delivery", func(t *testing.T) {
 		ep, task := mustNewTaskFixture(t, true)
 		stream := newFakeReadyStream()
 		tasks := newFakeTaskStore()
@@ -329,8 +334,8 @@ func TestProcessTicketNonRetryable4xxPreDisabledAndLockContention(t *testing.T) 
 		if err != nil {
 			t.Fatalf("NewWorker failed: %v", err)
 		}
-		if err := w.ProcessTicket(context.Background(), domain.ReadyTicket{TaskID: task.ID}); err != nil {
-			t.Fatalf("ProcessTicket failed: %v", err)
+		if err := w.ProcessDelivery(context.Background(), stream.newDelivery(task.ID)); err != nil {
+			t.Fatalf("ProcessDelivery failed: %v", err)
 		}
 		if sender.calls.Load() != 0 || len(stream.acked) != 1 {
 			t.Fatalf("expected skip + ack on lock contention, calls=%d acked=%d", sender.calls.Load(), len(stream.acked))
@@ -375,8 +380,7 @@ func TestWorkerRunGracefulDrainOnCancel(t *testing.T) {
 		runErrCh <- w.Run(ctx)
 	}()
 
-	ticket := domain.ReadyTicket{TaskID: task.ID, Topic: "ferry.tasks.ready", Partition: 0, Offset: 42}
-	stream.pollCh <- []domain.ReadyTicket{ticket}
+	stream.pollCh <- []domain.ReadyDelivery{stream.newDelivery(task.ID)}
 
 	// 等在途 HTTP 真正进入发送阶段后触发 SIGTERM（cancel）。
 	select {

@@ -111,13 +111,13 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	var req createTaskRequest
 	maxBody := int64(h.cfg.MaxPayloadBytes) + taskEnvelopeOverheadBytes
 	if err := decodeJSONBody(w, r, maxBody, &req); err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_JSON", err.Error())
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidJSON, err.Error())
 		return
 	}
 
 	endpointID, err := uuid.Parse(strings.TrimSpace(req.EndpointID))
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_ENDPOINT_ID", "endpoint_id must be a valid UUID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidEndpointID, "endpoint_id must be a valid UUID")
 		return
 	}
 
@@ -165,7 +165,7 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_TASK_ID", "task id must be a valid UUID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidTaskID, "task id must be a valid UUID")
 		return
 	}
 
@@ -180,7 +180,7 @@ func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleListTaskAttempts(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_TASK_ID", "task id must be a valid UUID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidTaskID, "task id must be a valid UUID")
 		return
 	}
 
@@ -199,7 +199,7 @@ func (h *Handler) handleListTaskAttempts(w http.ResponseWriter, r *http.Request)
 func (h *Handler) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(r.PathValue("id"))
 	if err != nil {
-		writeErrorJSON(w, http.StatusBadRequest, "INVALID_TASK_ID", "task id must be a valid UUID")
+		writeErrorJSON(w, http.StatusBadRequest, errCodeInvalidTaskID, "task id must be a valid UUID")
 		return
 	}
 
@@ -226,14 +226,14 @@ func resolveIdempotencyKey(headerVal, bodyVal string) (string, error) {
 	return "", domain.NewValidationError("idempotency_key", "must be provided via Idempotency-Key header or body")
 }
 
-// createTask 编排幂等 Task 与 Outbox 记录的原子创建流程。
+// createTask 编排幂等 Task 原子创建流程（Outbox 行由存储层在同一事务中自动写入）。
 func (h *Handler) createTask(ctx context.Context, input createTaskInput) (domain.CreateTaskResult, error) {
 	ep, err := h.endpoints.GetEndpoint(ctx, input.EndpointID)
 	if err != nil {
 		return domain.CreateTaskResult{}, err
 	}
 
-	task, outbox, err := domain.NewTask(domain.NewTaskParams{
+	task, err := domain.NewTask(domain.NewTaskParams{
 		Endpoint:       ep,
 		IdempotencyKey: input.IdempotencyKey,
 		RawPayload:     input.RawPayload,
@@ -248,7 +248,7 @@ func (h *Handler) createTask(ctx context.Context, input createTaskInput) (domain
 		return domain.CreateTaskResult{}, err
 	}
 
-	return h.tasks.CreateTaskIdempotent(ctx, task, outbox)
+	return h.tasks.CreateTaskIdempotent(ctx, task)
 }
 
 // cancelTask 先抢占 Execution Lock，再在 PostgreSQL 中原子取消处于非终态的 Task（ADR-0008 §3）。

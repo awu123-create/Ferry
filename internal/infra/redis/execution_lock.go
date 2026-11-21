@@ -7,8 +7,6 @@ import (
 
 	"github.com/google/uuid"
 	goredis "github.com/redis/go-redis/v9"
-
-	"github.com/awu123-create/ferry/internal/domain"
 )
 
 // AcquireExecutionLock 尝试为指定 taskID 获取短时排他执行互斥锁（Execution Lock）。
@@ -21,10 +19,10 @@ import (
 //  4. 抢锁成功返回 (token, true, nil)；锁已被其他调用方持有则返回 ("", false, nil)。
 func (c *Client) AcquireExecutionLock(ctx context.Context, taskID uuid.UUID, ttl time.Duration) (string, bool, error) {
 	if ttl <= 0 {
-		return "", false, domain.NewValidationError("ttl", "must > 0")
+		return "", false, fmt.Errorf("execution lock ttl must be > 0")
 	}
 	if taskID == uuid.Nil {
-		return "", false, domain.NewValidationError("taskID", "must not be empty")
+		return "", false, fmt.Errorf("execution lock task id must not be empty")
 	}
 
 	id, err := uuid.NewV7()
@@ -55,10 +53,10 @@ func executionLockKey(taskID uuid.UUID) string {
 //   - 严禁执行无条件 DEL，防止锁过期后误删新持有者的互斥锁。
 func (c *Client) ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error {
 	if taskID == uuid.Nil {
-		return domain.NewValidationError("taskID", "must not be empty")
+		return fmt.Errorf("execution lock task id must not be empty")
 	}
 	if token == "" {
-		return domain.NewValidationError("token", "must not be empty")
+		return fmt.Errorf("execution lock token must not be empty")
 	}
 
 	var script = goredis.NewScript(`

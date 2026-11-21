@@ -67,17 +67,13 @@ func TestPOMappingRoundTrip(t *testing.T) {
 		t.Fatalf("attempt round trip mismatch: got %+v want %+v", got, att)
 	}
 
-	outbox := domain.OutboxItem{
+	outPO := outboxPO{
 		ID:        9,
 		TaskID:    task.ID,
 		DeliverAt: now,
 		CreatedAt: now,
 	}
-	outPO := toOutboxPO(outbox)
 	if outPO.TableName() != "outbox" {
 		t.Fatalf("unexpected table name %q", outPO.TableName())
-	}
-	if got := toDomainOutboxItem(outPO); got != outbox {
-		t.Fatalf("outbox round trip mismatch: got %+v want %+v", got, outbox)
 	}
 }

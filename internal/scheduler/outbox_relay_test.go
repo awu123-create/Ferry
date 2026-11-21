@@ -9,13 +9,11 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
-
-	"github.com/awu123-create/ferry/internal/domain"
 )
 
 type fakeOutboxStore struct {
 	mu      sync.Mutex
-	batches [][]domain.OutboxItem
+	batches [][]uuid.UUID
 	notify  chan struct{}
 	errOnce error
 }
@@ -23,7 +21,7 @@ type fakeOutboxStore struct {
 func (f *fakeOutboxStore) ClaimAndDispatchImmediateOutbox(
 	ctx context.Context,
 	limit int,
-	dispatch func(ctx context.Context, items []domain.OutboxItem) error,
+	dispatch func(ctx context.Context, taskIDs []uuid.UUID) error,
 ) (int, error) {
 	f.mu.Lock()
 	if f.errOnce != nil {
@@ -36,17 +34,17 @@ func (f *fakeOutboxStore) ClaimAndDispatchImmediateOutbox(
 		f.mu.Unlock()
 		return 0, nil
 	}
-	items := f.batches[0]
-	if len(items) > limit {
-		items = items[:limit]
+	taskIDs := f.batches[0]
+	if len(taskIDs) > limit {
+		taskIDs = taskIDs[:limit]
 	}
 	f.batches = f.batches[1:]
 	f.mu.Unlock()
 
-	if err := dispatch(ctx, items); err != nil {
+	if err := dispatch(ctx, taskIDs); err != nil {
 		return 0, err
 	}
-	return len(items), nil
+	return len(taskIDs), nil
 }
 
 func (f *fakeOutboxStore) WaitForOutboxNotification(ctx context.Context) error {
@@ -90,8 +88,8 @@ func TestOutboxRelayConstructorAndRelayOnce(t *testing.T) {
 
 	id1, id2 := uuid.New(), uuid.New()
 	store := &fakeOutboxStore{
-		batches: [][]domain.OutboxItem{
-			{{ID: 1, TaskID: id1}, {ID: 2, TaskID: id2}},
+		batches: [][]uuid.UUID{
+			{id1, id2},
 		},
 	}
 	pub := &fakeReadyPublisher{}
@@ -126,8 +124,8 @@ func TestOutboxRelayDrainsBacklogWakesOnNotifyAndExitsCleanly(t *testing.T) {
 	store := &fakeOutboxStore{
 		// 第一批拉满 BatchSize=2 应立即排空第二批；同时验证瞬时错误后会恢复继续搬运。
 		errOnce: errors.New("transient pg hiccup"),
-		batches: [][]domain.OutboxItem{
-			{{ID: 1, TaskID: id1}, {ID: 2, TaskID: id2}},
+		batches: [][]uuid.UUID{
+			{id1, id2},
 		},
 		notify: notifyCh,
 	}
@@ -136,7 +134,7 @@ func TestOutboxRelayDrainsBacklogWakesOnNotifyAndExitsCleanly(t *testing.T) {
 			if count == 2 {
 				// 模拟收到新入箱通知后迅速唤醒搬运第三条记录。
 				store.mu.Lock()
-				store.batches = append(store.batches, []domain.OutboxItem{{ID: 3, TaskID: id3}})
+				store.batches = append(store.batches, []uuid.UUID{id3})
 				store.mu.Unlock()
 				notifyCh <- struct{}{}
 			}

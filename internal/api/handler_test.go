@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +59,7 @@ type taskKey struct {
 type fakeTaskStore struct {
 	byID     map[uuid.UUID]domain.Task
 	byKey    map[taskKey]uuid.UUID
-	outbox   []domain.OutboxItem
+	outbox   []uuid.UUID
 	attempts map[uuid.UUID][]domain.DeliveryAttempt
 }
 
@@ -69,7 +71,7 @@ func newFakeTaskStore() *fakeTaskStore {
 	}
 }
 
-func (s *fakeTaskStore) CreateTaskIdempotent(_ context.Context, task domain.Task, outbox domain.OutboxItem) (domain.CreateTaskResult, error) {
+func (s *fakeTaskStore) CreateTaskIdempotent(_ context.Context, task domain.Task) (domain.CreateTaskResult, error) {
 	key := taskKey{endpointID: task.EndpointID, idemKey: task.IdempotencyKey}
 	if existingID, exists := s.byKey[key]; exists {
 		existing := s.byID[existingID]
@@ -80,7 +82,7 @@ func (s *fakeTaskStore) CreateTaskIdempotent(_ context.Context, task domain.Task
 	}
 	s.byID[task.ID] = task
 	s.byKey[key] = task.ID
-	s.outbox = append(s.outbox, outbox)
+	s.outbox = append(s.outbox, task.ID)
 	return domain.CreateTaskResult{Task: task, Created: true}, nil
 }
 
@@ -290,7 +292,7 @@ func TestCancelTaskLockMutexAndStateGuard(t *testing.T) {
 	}
 	epStore.items[ep.ID] = ep
 
-	task, outbox, err := domain.NewTask(domain.NewTaskParams{
+	task, err := domain.NewTask(domain.NewTaskParams{
 		Endpoint:       ep,
 		IdempotencyKey: "cancel-1",
 		RawPayload:     []byte(`{"k":1}`),
@@ -301,7 +303,7 @@ func TestCancelTaskLockMutexAndStateGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewTask failed: %v", err)
 	}
-	if _, err := taskStore.CreateTaskIdempotent(ctx, task, outbox); err != nil {
+	if _, err := taskStore.CreateTaskIdempotent(ctx, task); err != nil {
 		t.Fatalf("CreateTaskIdempotent failed: %v", err)
 	}
 
@@ -344,4 +346,64 @@ func TestCancelTaskLockMutexAndStateGuard(t *testing.T) {
 	if againRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 cancelling terminal task, got %d: %s", againRec.Code, againRec.Body.String())
 	}
+}
+
+func TestWriteDomainErrorSanitizesWrappedErrors(t *testing.T) {
+	h, err := NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, newFakeTaskStore(), newFakeLocker(), nil, HandlerConfig{})
+	if err != nil {
+		t.Fatalf("NewHandler failed: %v", err)
+	}
+
+	t.Run("wrapped sentinel does not leak internal diagnostic detail", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		wrapped := fmt.Errorf("cancel task 123: concurrent state transition (status=PENDING): %w", domain.ErrTaskNotCancellable)
+		h.writeDomainError(rec, wrapped)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict, got %d", rec.Code)
+		}
+		var body errorEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode error body: %v", err)
+		}
+		if body.Error.Code != errCodeTaskNotCancellable || body.Error.Message != domain.ErrTaskNotCancellable.Error() {
+			t.Fatalf("unexpected error envelope: %+v", body)
+		}
+		if strings.Contains(rec.Body.String(), "concurrent state transition") {
+			t.Fatalf("response leaked internal context: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("wrapped validation error strips outer prefix and keeps field detail", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		valErr := domain.NewValidationError("payload", "must be valid JSON")
+		h.writeDomainError(rec, fmt.Errorf("internal decode wrapper: %w", valErr))
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+		}
+		var body errorEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode error body: %v", err)
+		}
+		if body.Error.Code != errCodeValidation || body.Error.Message != valErr.Error() {
+			t.Fatalf("unexpected validation envelope: %+v", body)
+		}
+	})
+
+	t.Run("non-domain internal error maps to 500", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		h.writeDomainError(rec, fmt.Errorf("execution lock ttl must be > 0"))
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 Internal Server Error, got %d", rec.Code)
+		}
+		var body errorEnvelope
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode error body: %v", err)
+		}
+		if body.Error.Code != errCodeInternal || body.Error.Message != errMsgInternal {
+			t.Fatalf("unexpected internal error envelope: %+v", body)
+		}
+	})
 }
