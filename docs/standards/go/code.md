@@ -1,6 +1,6 @@
 # Go 代码规范（Go Code Standard）
 
-编写或评审 `internal/` 与 `cmd/` 下的非测试 Go 代码时阅读本文件。通用规则与分级定义见 [CODING_STANDARDS.md](../../../CODING_STANDARDS.md)；跨包依赖白名单由 `.golangci.yml` 的 `depguard` 强制执行，本文不重复罗列。
+编写或评审 `internal/` 与 `cmd/` 下的非测试 Go 代码时阅读本文件。通用规则与分级定义见 [CODING_STANDARDS.md](../../../CODING_STANDARDS.md)；跨包依赖白名单（`depguard`）、HTTP 常量（`usestdlibvars`）与 `internal/{domain,infra/pg}` 禁裸调 `time.Now`（`forbidigo`）等机械规则由 `.golangci.yml` 强制执行，本文只保留架构与设计判断条款。
 
 ## 文件分工与数据库模型隔离
 
@@ -84,7 +84,7 @@
 ## 时间、Context 与 Goroutine
 
 - 所有持久化与领域时间统一规范化为 `.UTC()`。
-- 涉及业务时间判断与落库的时间必须可注入：`internal/domain` 与 `internal/infra/pg` 业务方法由调用方传入 `now time.Time`（禁止在仓储查询内偷偷调用 `time.Now()`）；`internal/{api,scheduler,worker}` 通过可注入时钟（如 `clock func() time.Time`，构造默认 `time.Now`）取当前时间。仅纯耗时测量（如 `time.Since` 统计 HTTP 请求 `duration_ms`）允许直接调用 `time.Now()`。
+- 涉及业务时间判断与落库的时间必须可注入：`internal/domain` 与 `internal/infra/pg` 业务方法由调用方传入 `now time.Time`（机械禁令由 `.golangci.yml` `forbidigo` 强制）；`internal/{api,scheduler,worker}` 通过可注入时钟（如 `clock func() time.Time`，构造默认 `time.Now`）取当前时间。仅纯耗时测量（如 `time.Since` 统计 HTTP 请求 `duration_ms`）允许直接调用 `time.Now()`。
 - `context.Context` 必须是所有 I/O 函数的第一个参数。
 - 每个启动的 goroutine 必须有明确归属方负责停止并等待退出（`sync.WaitGroup` 或 `errgroup`），杜绝野 goroutine；优雅停机须将“停止拉取新任务的 `ctx`”与“排空在途投递的 `drainCtx`”分离，确保 `SIGTERM` 下在途投递写完 PG 并释锁。
 - `init()` 禁止执行任何 I/O 或初始化全局运行时状态，启动装配一律在 `cmd/*/main.go` 显式完成。

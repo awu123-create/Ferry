@@ -48,7 +48,7 @@ go test -v -race -count=1 -run '^TestStore_' ./internal/infra/pg
 go test -v -race -count=1 -run '^TestImmediateDeliveryIntegration$' ./tests/integration
 ```
 
-里程碑收口前在容器运行状态下执行对应黑盒脚本 `./scripts/verify_m*.sh`。测完用 `make down` 停止容器，需要清卷时运行 `docker compose -f deploy/docker-compose.yml down -v`。
+里程碑收口前在容器运行状态下执行对应黑盒脚本 `make verify-m1`（刚跑过 `make test-integration` 或在 CI 中执行时可传 `SKIP_TESTS=1 make verify-m1` 跳过脚本内重复单测）。测完用 `make down` 停止容器，需要清卷时运行 `docker compose -f deploy/docker-compose.yml down -v`。
 
 ### `-short` 机制（禁止 `//go:build integration`）
 
@@ -76,7 +76,7 @@ if testing.Short() {
 
 ## 文件、包名与测试写法
 
-- **黑盒包名优先**：凡测试对外行为的测试文件，统一使用黑盒包名 `package <pkg>_test`（如 `package domain_test`、`package api_test`、`package worker_test`、`package pg_test`、`package integration_test`），强迫测试绑定公开契约；仅单独测试非导出核心算法（如 `internal/infra/kafka/reader_test.go` 水位算法）时，才允许使用同包白盒文件。
+- **黑盒包名优先**：测试对外行为的测试文件使用黑盒包名 `package <pkg>_test`（由 `.golangci.yml` `testpackage` 强制校验）；仅在独立验证非导出核心算法（如 `internal/infra/kafka/reader_test.go` 水位算法）时才显式豁免白盒包名，或在同包放 `export_test.go` 暴露必要切口。
 - **文件命名**：
   - 单元测试：`<subject>_test.go`；
   - 同包多个测试文件共用内存 fake 时，拆出 `fake_<port>_test.go`；

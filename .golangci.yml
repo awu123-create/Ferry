@@ -26,7 +26,21 @@ linters:
     - misspell
     - nolintlint
     - depguard
+    - usestdlibvars
+    - testpackage
+    - forbidigo
   settings:
+    usestdlibvars:
+      http-method: true
+      http-status-code: true
+    testpackage:
+      skip-regexp: '^export_test\.go$'
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^time\.Now$'
+          pkg: '^time$'
+          msg: "inject now time.Time from caller instead of calling time.Now() directly in internal/domain or internal/infra/pg"
     nolintlint:
       require-explanation: true
       require-specific: true
@@ -296,6 +310,17 @@ linters:
               desc: "foundation packages must not depend upward on infra adapters"
             - pkg: github.com/awu123-create/ferry/cmd
               desc: "foundation packages must not import cmd assembly roots"
+  exclusions:
+    rules:
+      - path: '^internal/infra/kafka/reader_test\.go$'
+        linters:
+          - testpackage
+      - path: '_test\.go$'
+        linters:
+          - forbidigo
+      - path-except: '^internal/(domain|infra/pg)/'
+        linters:
+          - forbidigo
 
 issues:
   max-issues-per-linter: 0

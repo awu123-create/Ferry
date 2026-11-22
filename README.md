@@ -95,13 +95,13 @@ Ferry/
 ├── .env.example                 # 与 internal/config/config.go 对齐的环境变量示例
 ├── .github/
 │   ├── pull_request_template.md # GitHub PR 正文模板
-│   └── workflows/ci.yml         # GitHub Actions: verify（格式/lint/短单测/构建）与 integration（真容器集成测试）
-├── .golangci.yml                # golangci-lint v2 静态检查、depguard 分层与 json_v2 门禁
-├── .pre-commit-config.yaml      # 本地提交钩子（基础检查、ADR 编号、gofmt、增量 lint、短单测）
+│   └── workflows/ci.yml         # GitHub Actions: verify（复用 Makefile 做格式/脚本/lint/短单测/构建）与 integration（真容器集成测试 + M1 黑盒验收）
+├── .golangci.yml                # golangci-lint v2 静态检查、depguard 分层、json_v2、usestdlibvars、testpackage 与 forbidigo 门禁
+├── .pre-commit-config.yaml      # 本地提交钩子（基础检查、ADR 编号、shellcheck/bash-n、gofmt、配置全量 lint、增量 lint、短单测）
 ├── AGENTS.md                    # 场景路由入口（指向工程规范与协作文档）
 ├── CODING_STANDARDS.md          # 全局编码基线（Hard / Judgement / Smell baseline override）
 ├── GLOSSARY.md                  # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
-├── Makefile                     # 开发、容器编排、集成测试与验收入口 (setup-hooks / fmt / lint / test / test-integration / up / down / migrate / verify-m1 / build)
+├── Makefile                     # 开发、校验、容器编排与验收入口 (setup-hooks / fmt / fmt-check / check-adr / check-scripts / lint / test / test-integration / up / down / migrate / verify-m1 / build)
 ├── go.mod                       # Go 1.27 模块定义
 ├── cmd/
 │   ├── ferry-server/            # 组装根：API 网关与 OutboxRelay

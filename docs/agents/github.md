@@ -1,6 +1,6 @@
 # Pull Requests 与分支协作（GitHub）
 
-本仓库采用单主干（`main`）开发模式，所有交付改动通过 Pull Request 合入 `main`，统一使用 `gh` CLI 操作。
+本仓库采用单主干（`main`）开发模式，所有交付改动通过 Pull Request 合入 `main`，统一使用 `gh` CLI 操作。自动化脚本或 Agent 调用 `gh` 时统一前置 `GH_PROMPT_DISABLED=1`，避免非 TTY 环境下弹出交互确认导致任务挂起。
 
 ## 目标分支（Target）
 
@@ -44,14 +44,26 @@ git push --force-with-lease
 
 （若存在多人或多 Agent 共享同一远程分支，改用 `git merge origin/main` + 普通 `git push`，避免改写共享历史。）
 
+### Stacked PR 拆分与按序合入
+
+需要按依赖串联多个切片 PR（`#N` -> `#N+1`）时：
+
+- **拆分前预查 Ruleset 必过检查**：执行 `GH_PROMPT_DISABLED=1 gh api repos/<owner>/<repo>/rulesets`（取规则集 ID 后查询详情）核对 `Protect main` 的必需检查名，确保首切片已包含对应 CI 任务，避免无法合入 `main`。
+- **按序合入固定顺序**（禁止先删上游远端分支再改下游 PR 的 base）：
+  1. `GH_PROMPT_DISABLED=1 gh pr merge <N> --squash`（不带 `--delete-branch`）；
+  2. `GH_PROMPT_DISABLED=1 gh pr edit <N+1> --base main`；
+  3. 删除已合入的上游远端分支：`git push origin --delete <old-branch>`；
+  4. 将下游分支变基到最新 `origin/main` 并强推：`git fetch origin --prune && git rebase --onto origin/main <old-branch-sha> <next-branch> && git push --force-with-lease`。
+
 拉齐 `main` 后仅解决冲突不算完成；在推送更新或合入 `main` 前，必须确认以下清单全部满足：
 
 1. **工作区与基础门禁**
    - `git status` 干净，无遗留临时文件或跨切片越界改动；
-   - 改动文件通过 `pre-commit run --files <changed-files>`（或 `pre-commit run --all-files`，覆盖尾部空白、EOF 换行、YAML、冲突标记、私钥检测）。
+   - 改动文件通过 `pre-commit run --files <changed-files>`（或 `pre-commit run --all-files`，覆盖尾部空白、EOF 换行、YAML、冲突标记、私钥检测、`scripts/*.sh` 静态检查与 `.golangci.yml` 全量校验）。
 2. **Go 静态检查、单测与构建**（涉及 Go 代码或 lint 配置时）
-   - `make fmt`
-   - `make lint`（`golangci-lint config verify` + `golangci-lint run ./...`，含 `depguard` 分层与 `json_v2` 门禁）
+   - `make fmt-check`（未格式化时先执行 `make fmt`）
+   - `make check-scripts`（涉及 `scripts/*.sh` 时）
+   - `make lint`（`golangci-lint config verify` + `golangci-lint run ./...`，含 `depguard`、`json_v2`、`usestdlibvars`、`testpackage`、`forbidigo` 门禁）
    - `make test`（`go test -race -short ./...`）
    - `make build`
 3. **集成与黑盒验收**（涉及数据库迁移、存储适配器、中间件、调度或投递链路时）
