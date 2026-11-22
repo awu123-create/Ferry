@@ -32,6 +32,17 @@ linters:
       require-specific: true
     depguard:
       rules:
+        json_v2:
+          list-mode: lax
+          files:
+            - "$all"
+          allow:
+            - encoding/json/v2
+            - encoding/json/jsontext
+          deny:
+            - pkg: encoding/json
+              desc: "use Go 1.27 encoding/json/v2 or encoding/json/jsontext instead of legacy encoding/json"
+
         domain:
           list-mode: strict
           files:
