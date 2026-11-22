@@ -28,7 +28,7 @@ Ferry 的总体架构与可靠性契约已在 [ADR-0001](./0001-unified-http-tas
 
 | 层级 | 定稿选型 | 关键工程配置与选型理由 |
 | :--- | :--- | :--- |
-| **Go 语言版本** | **`go 1.27`** | `go.mod` 与 `.golangci.yml` 统一锁定 `1.27`；使用本机 `go1.27` 升级 `golangci-lint v2` 至对应编译版以消除工具链版本撕裂 |
+| **Go 语言版本与 JSON** | **`go 1.27` + `encoding/json/v2` / `jsontext`** | `go.mod` 与 `.golangci.yml` 统一锁定 `1.27`；全仓 JSON 编解码统一采用 Go 1.27 `encoding/json/v2` 与 `encoding/json/jsontext`（拒绝旧 `encoding/json`，对应 `depguard` `json_v2` 规则随 Milestone 1 首个代码 PR 启用） |
 | **ORM 数据访问** | **`gorm.io/gorm` + `gorm.io/driver/postgres` + `gorm.io/datatypes`** | 开启 `SkipDefaultTransaction: true` 与 `PrepareStmt: true`；业务层不写裸 SQL，全部通过 GORM 模型、链式条件与 `clause` 构建 |
 | **数据库迁移** | **`pressly/goose/v3`**（`embed.FS` + CLI） | 唯一 DDL 迁移入口，负责建表、部分索引、约束与 `outbox` 触发器；**严禁开启 GORM `AutoMigrate`** |
 | **主键生成** | **`google/uuid`**（`uuid.NewV7()`） | 时间序有序主键，防止高并发随机 `UUIDv4` 写入引发 PG B-Tree 索引页分裂 |
@@ -41,7 +41,7 @@ Ferry 的总体架构与可靠性契约已在 [ADR-0001](./0001-unified-http-tas
 
 ### 二、GORM 与 Goose 协作边界（零手写业务 SQL 且不丢底层并发能力）
 
-1. **DDL 归 Goose，DML 归 GORM**：所有部分索引（`tasks_reconcile_idx`、`tasks_dlq_idx`）、唯一约束以及 `outbox` 写入通知均定义在 `migrations/0001_init.sql`；
+1. **DDL 归 Goose，DML 归 GORM**：所有表结构、部分索引、唯一约束以及 `outbox` 写入通知触发器均按 Milestone 生产调用需要通过 `migrations/NNNN_*.sql` 增量演进（见 [docs/standards/database.md](../standards/database.md)）；
 2. **并发原语全走 GORM 原生 `clause`**：
    - 入口幂等冲突：`tx.Clauses(clause.OnConflict{Columns: ... , DoNothing: true}).Create(&task)`；
    - Outbox 抢占与死信分批重放：`tx.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).Order("id ASC").Limit(100).Find(&rows)`；

@@ -5,17 +5,17 @@
 
 ---
 
-## 一、项目定位与演进背景（From `x-data` PG+River to Ferry）
+## 一、项目定位与演进背景（从同库异步队列演进至独立调度平台）
 
-在实习项目 `x-data` 的控制面中，异步任务采用的是 **PostgreSQL + River** 单库队列架构：控制面与业务运行表在同一个数据库事务内调用 `river.InsertTx` 插入任务，后台 Worker 轮询 PostgreSQL 领取任务，等待外部异步工作流结果时使用 `river.JobSnooze` 推迟下一次执行，队列并发数在启动配置中静态固定（如 `DecodeQueueWorkers = 2`）。
+在常规业务服务内部，同库异步队列（如 **PostgreSQL + River**）架构非常干净：控制面与业务表在同一个数据库事务内写入任务，后台 Worker 轮询 PostgreSQL 领取任务，等待外部结果时通过推迟重调度重试，并发度在启动配置中静态固定。
 
-这种模式在内部同库、低外部不确定性的场景下十分干净；但当需要将其演进为全公司跨业务线共用的**通用异步 HTTP 任务调度与外部 Webhook 投递平台（Ferry）**时，单库 PG 队列会撞上三道物理瓶颈：
+但当异步调度能力需要独立演进为跨业务线共用的**通用异步 HTTP 任务调度与外部 Webhook 投递平台（Ferry）**时，单库 PG 队列会撞上三道物理瓶颈：
 
-1. **跨业务线事务解耦**：不同上游微服务不可能直连 Ferry 的 PostgreSQL 去调 `InsertTx`，必须演进为独立 HTTP 网关 + 入口幂等约束 + 事务 Outbox 模式；
+1. **跨业务线事务解耦**：不同上游微服务不可能直连 Ferry 的 PostgreSQL 去调同库入队，必须演进为独立 HTTP 网关 + 入口幂等约束 + 事务 Outbox 模式；
 2. **调度与慢速派发解耦及水平扩缩容瓶颈**：单库轮询队列将“时间唤醒”与“慢 HTTP 阻塞调用”绑在同一层，既难以做分区级暂停背压，也限制了多实例消费吞吐——引入 **Kafka** 承接发件箱/延迟池与 Worker 之间的异步解耦削峰、多副本消费组水平扩展以及 Redis 故障时的分区级 `Pause` 背压阀门；
 3. **不可信慢下游队头阻塞与高频流控落库写放大**：外部商户 Webhook 与内部慢接口的吞吐能力、健康度差异极大（有的承受 500 QPS，有的 20 QPS 即雪崩，有的 10 秒超时挂死），若将高频限流顺延（Deferral）、熔断计数与倒计时排期直接频繁 `UPDATE` 落回 PostgreSQL，会引发严重的行锁竞争与 MVCC 死元组膨胀——引入 **Redis** 承担 Endpoint 级动态限流、带超时并发槽位、自动熔断与毫秒级延迟调度，把海量无损顺延与流控状态变更全部消纳在内存层。
 
-同时，Ferry 完整继承了 `x-data` 最核心的可靠性工程哲学：**领域表是唯一真相，队列只是调度载荷**——即使 Kafka 重复投递或 Redis 内存全部丢失，系统依然能以 PostgreSQL `tasks` 表为准自愈恢复，不丢单、不重复乱改终态。
+同时，Ferry 延续了单库事务队列最核心的可靠性工程哲学：**领域表是唯一真相，队列只是调度载荷**——即使 Kafka 重复投递或 Redis 内存全部丢失，系统依然能以 PostgreSQL `tasks` 表为准自愈恢复，不丢单、不重复乱改终态。
 
 ---
 
@@ -153,9 +153,9 @@
 
 ---
 
-## 五、核心数据库表结构设计（PostgreSQL 16）
+## 五、目标数据库表结构设计（PostgreSQL 16）
 
-全系统严格收敛为 **4 张核心表**（迁移文件 `migrations/0001_init.sql`）：
+全系统目标数据模型收敛为 **4 张核心表**（以下为完整架构契约；遵循 [docs/standards/database.md](./standards/database.md) 的调用方原则，各表、列与部分索引通过 `migrations/NNNN_*.sql` 随对应 Milestone 的生产代码按需增量落地，当前 `main` 分支尚未落盘迁移脚本）：
 
 ```sql
 CREATE TABLE endpoints (
@@ -280,7 +280,7 @@ CREATE TRIGGER outbox_notify_trg
 
 | 层级 | 定稿选型 | 关键配置与工程职责 |
 | :--- | :--- | :--- |
-| **Go 版本** | **`go 1.27`** | `go.mod` 与 `.golangci.yml` 统一锁定 `1.27`，升级 `golangci-lint v2` 为 `go1.27` 编译版以对齐工具链 |
+| **Go 版本与 JSON** | **`go 1.27` + `encoding/json/v2` / `jsontext`** | `go.mod` 与 `.golangci.yml` 统一锁定 `1.27`；业务编解码统一使用 Go 1.27 `encoding/json/v2` 与 `jsontext`（对应 `depguard` `json_v2` 门禁随 Milestone 1 首个代码 PR 启用） |
 | **ORM 数据访问** | **`gorm.io/gorm` + `gorm.io/driver/postgres` + `gorm.io/datatypes`** | 全量接管业务 CRUD 与事务（底层复用 `pgx/v5`）；开启 `SkipDefaultTransaction: true` 与 `PrepareStmt: true` |
 | **数据库迁移** | **`pressly/goose/v3`**（`embed.FS` + CLI） | 唯一 DDL 迁移入口（管建表、部分索引、约束与 `outbox` 触发器）；**严禁使用 GORM `AutoMigrate`** |
 | **主键生成** | **`google/uuid`**（`uuid.NewV7()`） | 按时间戳递增有序，防止高并发 `UUIDv4` 随机写引发 PG B-Tree 索引页分裂 |
@@ -306,137 +306,52 @@ CREATE TRIGGER outbox_notify_trg
 
 ---
 
-## 八、分阶段实施路线图（Milestone 1 ~ 4，阶段独立可运行、可验收）
+## 八、当前仓库树、模块分层边界与演进路线
 
-严格遵循 **“每个 Milestone 独立可用、可编译运行、有明确自动化验收脚本，且后端核心先于极简前端控制台”** 原则：
+### 8.1 当前 `main` 分支已落地仓库树
 
-### 固定端口与模块拓扑规划
+```text
+Ferry/
+├── AGENTS.md                  # 场景路由入口（指向协作与分层编码规范）
+├── CODING_STANDARDS.md        # 跨语言编码基线（Hard / Judgement / Smell baseline override）
+├── GLOSSARY.md                # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
+├── Makefile                   # 基础开发与构建入口 (setup-hooks / fmt / lint / test / build)
+├── README.md                  # 项目概览与当前快速校验说明
+├── go.mod                     # Go 1.27 模块定义
+├── .github/                   # GitHub Actions CI (ci.yml) 与 PR 模板 (pull_request_template.md)
+├── .golangci.yml              # golangci-lint v2 静态检查与 depguard 分层依赖门禁
+├── .pre-commit-config.yaml    # 本地提交钩子（基础检查、ADR 编号、gofmt、增量 lint、短单测）
+├── cmd/                       # 四个可执行入口骨架（ferry-server / ferry-worker / chaos-receiver / ferry-bench）
+└── docs/
+    ├── ARCHITECTURE.md        # 本架构设计总纲
+    ├── adr/                   # ADR 0001 ~ 0008
+    ├── agents/                # Issue tracker、Triage 标签、领域文档与 GitHub 协作规约
+    ├── specs/                 # 阶段规划文档（roadmap.md，仅作规划上下文）
+    └── standards/             # 分层工程规范（go/code.md、go/testing.md、database.md、records.md）
+```
 
-- **服务端口矩阵**：
-  - `ferry-server`（API + Relay + Forwarder + Reconciler）：REST API `:8080`、Prometheus `/metrics` `:2112`
-  - `ferry-worker`（Kafka 投递 Worker，支持与 server 独立进程或多实例部署）：健康探针 `/readyz` `:8082`、Prometheus `/metrics` `:2113`
-  - `chaos-receiver`（内置混沌下游靶场）：`:8081`
-  - 基础设施容器：PostgreSQL `:5432`、Kafka (KRaft) `:9092`、Redis `:6379`、Prometheus `:9090`、Grafana `:3000`
-- **最终代码目录规划**：
-  ```text
-  Ferry/
-  ├── GLOSSARY.md              # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
-  ├── cmd/
-  │   ├── ferry-server/        # 组装根：HTTP API 网关 + Outbox Relay + Delayed Forwarder + PG Reconciler
-  │   ├── ferry-worker/        # 组装根：Kafka 消费者 + 流控准入 + HTTP 签名投递 + 优雅停机
-  │   ├── chaos-receiver/      # 混沌故障注入靶场 (模拟延迟/500/429/验签)
-  │   └── ferry-bench/         # 并发压测与隔离性验证 CLI
-  ├── internal/
-  │   ├── domain/              # 纯 Go 领域内核：Endpoint/Task 聚合、DeliveryAttempt、值对象、签名与退避策略
-  │   ├── api/                 # 入站 HTTP 控制面深模块：ServeMux 路由、DTO 校验、直接编排幂等创建/取消/重放
-  │   ├── scheduler/           # 后台调度深模块：OutboxRelay、DelayedForwarder、Reconciler
-  │   ├── worker/              # 投递执行深模块：Step A~E 状态机、25s 优雅停机排空与 Redis 断连背压暂停
-  │   ├── infra/               # 出站基础设施适配器环（消费方接口实现，禁止向上依赖）
-  │   │   ├── pg/              # GORM 仓储（私有 PO、同事务 Outbox、SKIP LOCKED、Goose 迁移挂载）
-  │   │   ├── kafka/           # twmb/franz-go 幂等生产者/消费者封装（含分区 Pause/Resume）
-  │   │   ├── redis/           # go-redis/v9 适配器（延迟池租约 Lua、admit_endpoint.lua 流控、Execution Lock）
-  │   │   └── httpclient/      # 调优 http.Transport 连接池、LimitReader 截断与 Retry-After 解析
-  │   ├── config/              # 12-Factor 强类型环境变量解析
-  │   ├── logger/              # zap JSON 日志、Sampler 采样限流与 GORM 慢 SQL Logger 适配
-  │   └── metrics/             # Prometheus 指标定义
-  ├── migrations/              # 0001_init.sql 与 embed.go（暴露 embed.FS 供 Goose 挂载）
-  ├── deploy/                  # docker-compose.yml, prometheus.yml, grafana/dashboards/
-  ├── scripts/                 # verify_m1.sh ~ verify_m4.sh 可重复自动化验收脚本
-  └── web/                     # Milestone 4 独立静态控制台 (仅消费 /v1/* REST API)
-  ```
-- **模块分层与单向依赖边界**（详见 [ADR-0007](./adr/0007-tactical-ddd-and-deep-module-seams.md)、[ADR-0008](./adr/0008-concurrency-fencing-and-flow-control-hardening.md) 与 [GLOSSARY.md](../GLOSSARY.md)）：
-  - **零透传原则**：不设立浅层 `internal/service` 包，由 `api`、`scheduler`、`worker` 直接消费 `domain` 与消费方窄接口；`worker` 通过纯方法 `Ready() bool` 交由组装根 `cmd/ferry-worker` 暴露 `/readyz`；
-  - **DO/PO 隔离与隐藏式 Outbox**：`domain` 零 ORM/JSON 标签；`gorm` PO 结构体私有化于 `internal/infra/pg` 内，并以 `CreateTaskIdempotent`、`SaveDeliveryOutcome`、`ReplayDeadLetters` 与绑定 `5s` 硬超时的双通道回调切口 `ClaimAndDispatchOutbox` 隐藏全部事务与发件箱细节；
-  - **依赖方向门禁**：仅 `cmd/*` 可同时引用编排模块与 `internal/infra/*` 完成组装与编译期接口断言，其余各层通过 `.golangci.yml` `depguard` 的 `strict` 白名单与跨包隔离规则硬性拦截。
+### 8.2 模块分层与单向依赖边界
+
+详见 [ADR-0007](./adr/0007-tactical-ddd-and-deep-module-seams.md)、[ADR-0008](./adr/0008-concurrency-fencing-and-flow-control-hardening.md)、[GLOSSARY.md](../GLOSSARY.md) 与 [docs/standards/go/code.md](./standards/go/code.md)：
+
+- **零透传原则**：不设立浅层 `internal/service` 包，由 `api`、`scheduler`、`worker` 直接消费 `domain` 与消费方窄接口；`worker` 通过纯方法 `Ready() bool` 交由组装根 `cmd/ferry-worker` 暴露 `/readyz`；
+- **DO/PO 隔离与隐藏式 Outbox**：`domain` 零 ORM/JSON 标签；`gorm` PO 结构体私有化于 `internal/infra/pg/models.go` 内，并以 `CreateTaskIdempotent`、`SaveDeliveryOutcome`、`ReplayDeadLetters` 与绑定 `5s` 硬超时的双通道回调切口 `ClaimAndDispatchOutbox` 隐藏事务与发件箱细节；
+- **依赖方向门禁**：仅 `cmd/*` 可同时引用编排模块与 `internal/infra/*` 完成组装与编译期接口断言，其余各层通过 `.golangci.yml` `depguard` 的 `strict` 白名单与跨包隔离规则硬性拦截。
+
+### 8.3 分阶段实施规划
+
+Milestone 1 ~ 4 的切片边界、服务端口矩阵、目标模块目录规划与各阶段验收脚本规划统一维护在 [docs/specs/roadmap.md](./specs/roadmap.md)（规划上下文，活工单状态与进度统一维护在 GitHub Issues）。
 
 ---
 
-### Milestone 1：最小端到端可靠立即直投闭环（PG + Outbox 立即通道 + Kafka + 执行锁 + 验签靶场）
+## 九、规范、词表与架构决策索引（Standards, Glossary & ADRs）
 
-- **独立可交付目标**：系统已可作为“立即可靠单次 HTTP 投递网关”零悬空独立运行——支持创建 Endpoint、原始字节保真幂等创建立即任务（暂拒未来 `deliver_at`，默认 `max_attempts = 1` 不产生悬空 `RETRYING`）、Outbox 立即通道直推 Kafka（固定 `task_id` 分区键）、Redis `Execution Lock` 防重与 `POST /cancel` 抢锁互斥、Worker 签名直投下游记录 `task_attempts`、以及 `SIGTERM` 优雅停机。
-- **核心模块与表结构**：
-  - `deploy/docker-compose.yml`（启动 PostgreSQL 16 + Kafka KRaft + Redis 7 基础编排）
-  - `migrations/0001_init.sql` + `embed.go`（建齐 4 张核心表与全套索引，含 `payload BYTEA`、`task_attempts.replay_count`、`outbox(deliver_at, id)` 复合索引，后续 Milestone 零破坏性改表）
-  - `internal/infra/redis`（基础版：提供带持有人 `token` 验主释放的 `Execution Lock`，同时服务于 Worker 执行互斥与 API `Cancel` 抢锁互斥）
-  - `cmd/ferry-server`（API：`POST/GET /v1/endpoints`、`POST/GET /v1/tasks`、`POST /v1/tasks/{id}/cancel`、`/healthz`、`/readyz`；内置 Outbox 立即通道处理 `deliver_at <= now()` 直推 Kafka）
-  - `cmd/ferry-worker`（Kafka 消费、`Execution Lock` + 复合乐观锁守卫、HMAC-SHA256 原始字节签名投递、写 `task_attempts`、2xx 迁移 `SUCCEEDED` / 失败迁移 `DEAD_LETTER`、25s `SIGTERM` 优雅停机）
-  - `cmd/chaos-receiver`（基础版：校验 `X-Ferry-Signature` 签名正确性，记录 `X-Ferry-Task-ID` 收到次数，支持返回指定状态码 `200`/`400`）
-- **可运行验收命令（`scripts/verify_m1.sh`）**：
-  ```bash
-  docker compose -f deploy/docker-compose.yml up -d postgres kafka redis
-  go test -race ./...
-  # 自动化脚本依次启动 chaos-receiver(:8081)、ferry-server(:8080)、ferry-worker(:8082) 并验证：
-  # 1. 创建带 signing_secret 的 Endpoint
-  # 2. 携带同一 Idempotency-Key 并发发 10 次 POST /v1/tasks -> 仅生成 1 条任务，异载荷返回 409
-  # 3. chaos-receiver 验证收到带合法 HMAC 签名的原始字节请求，PG tasks.status == 'SUCCEEDED'，task_attempts == 1
-  # 4. 发一条指向返回 400 的任务 -> 立即进 DEAD_LETTER 且 attempt == 1
-  # 5. 验证在途持锁期间调用 POST /cancel 返回 409 Conflict，向 ferry-worker 发 SIGTERM 确认在途任务完成后安全退出
-  ./scripts/verify_m1.sh
-  ```
-
----
-
-### Milestone 2：任意延迟调度、指数退避重试、PG 游标对账自愈与死信批量重放
-
-- **独立可交付目标**：打通全时间维度与灾难自愈闭环——开放任意未来 `deliver_at` 定时任务、默认 `6` 次指数退避（`5s -> 25s -> ~2m -> ~10m -> ~52m` ±20% 抖动，支持环境变量覆盖加速测试）与 `Retry-After` 解析、Forwarder 30s 租约与比对分数条件 `ZREM`、Redis 内存全清空后的 `60s` PG Reconciler 游标流式回灌延迟池恢复，以及单条/按条件分批死信重放。
-- **核心模块增量**：
-  - `internal/infra/redis` + `internal/scheduler`：`claim_delayed.lua`（30s `Schedule Lease`）与比对分数条件删除 `ack_delayed.lua`、Outbox 延迟通道（`deliver_at > now()` 写延迟池，遇 Redis 故障独立退避）、抢锁争用 `ZADD NX` 保底顺延
-  - `internal/domain` + `internal/infra/httpclient`：可配置指数退避策略与 `Retry-After` 响应头解析，更新 `RETRYING` 提交后再写 `ferry:delayed`
-  - `internal/scheduler`：`60s`（支持环境变量配置如验收期 `2s` 加速验证）PG Reconciler，游标循环扫完超期在途任务，识别顺延时间对齐并以 `ZADD NX` 补回丢失调度
-  - `internal/api` + `internal/infra/pg`：`POST /v1/tasks/{id}/replay` 与 `POST /v1/dlq/replay`（`FOR UPDATE SKIP LOCKED LIMIT <= 500` 分批重置 `attempt=0, replay_count+1` 并同事务写 `outbox`）
-  - `cmd/chaos-receiver` 扩展：支持按次数/概率返回 `500`、`429`（附带 `Retry-After: 2`）及固定延迟
-- **可运行验收命令（`scripts/verify_m2.sh`）**：
-  ```bash
-  go test -race ./...
-  # 自动化脚本（通过环境变量将基础退避与对账周期覆写为秒级）验证：
-  # 1. 提交 deliver_at=+3s 定时任务 -> 确认在 3s 前未投递，3~4s 间精准变为 SUCCEEDED
-  # 2. 目标前 2 次返回 500、第 3 次返回 200 -> 验证指数退避后成功，task_attempts 记录 3 行流水
-  # 3. 故意耗尽 max_attempts=2 落入 DEAD_LETTER -> 调 POST /v1/dlq/replay 批量重放并成功投递，replay_count == 1
-  # 4. 灾难演练：提交 20 条 +5s 延迟任务，立即执行 docker compose exec redis redis-cli FLUSHALL 清空内存 -> Reconciler 游标扫描自动塞回延迟池并全部投递成功（0 丢单）
-  ./scripts/verify_m2.sh
-  ```
-
----
-
-### Milestone 3：Endpoint 三维流控虚拟排号、Prometheus/Grafana 可观测闭环与混沌压测
-
-- **独立可交付目标**：交付完整生产级流控保护与秋招简历级压测监控数据——完成基于 Redis `TIME` 的熔断器（含半开探测超时）/ `1/QPS` 虚拟排号令牌桶 / 防泄漏并发槽位与对称 `CompleteDelivery` 结算、Worker `Endpoint` 本地短缓存、Redis 断连 Fail-Safe 背压保护、全套 Prometheus/Grafana 看板与多场景混沌压测报告脚本。
-- **核心模块增量**：
-  - `internal/infra/redis`（`admit_endpoint.lua` + `complete_delivery.lua`）+ `internal/worker`：`AdmitOrDefer` 原子准入与按 `1/QPS` 虚拟排号摊平顺延、`CompleteDelivery` 对称归还槽位并更新熔断/`429` 冷却、`Endpoint` `3s` 短缓存；Worker 检测 Redis 断连自动停拉 Kafka 并通过 `Ready()` 置 `/readyz=503`
-  - `internal/metrics` + `deploy/prometheus.yml` + `deploy/grafana/dashboards/ferry.json`：完整采集 Outbox 积压、ZSet 深度、Kafka Lag、各 Endpoint QPS/耗时分布（P50/P95/P99）、限流顺延数与熔断状态变更
-  - `cmd/chaos-receiver` 完整混沌模式 + `cmd/ferry-bench` 压测发压器
-- **可运行验收命令（`scripts/verify_m3.sh`）**：
-  ```bash
-  docker compose -f deploy/docker-compose.yml up -d
-  go test -race ./...
-  # 自动化压测与混沌隔离验收：
-  # 1. 同时压测健康 Endpoint-A（QPS=200，50ms响应）与故障 Endpoint-B（模拟 3s 慢响应 + 100% 500）
-  # 2. 验证 Endpoint-B 触发熔断 OPEN（ferry_endpoint_circuit_state == 1），Worker 协程不被占满
-  # 3. 验证 Endpoint-A 的 P99 投递延迟不受 Endpoint-B 拖累，且超出 rate_limit_qps 的请求平滑回退不超限
-  # 4. 校验 http://localhost:2112/metrics 与 :2113/metrics 核心指标非零输出，Grafana (:3000) 面板正常拉取
-  ./scripts/verify_m3.sh
-  ```
-
----
-
-### Milestone 4（最后阶段低复杂度收尾）：极简只读与死信重放控制台
-
-- **独立可交付目标**：在不侵入后端核心代码的独立目录 `web/`（建议独立 Git Worktree 并行生成）内，仅通过冻结的 `/v1/*` REST API 构建极简静态单页控制台，方便本地演示、死信人工排查与一键批量重放操作截图。
-- **页面与能力边界（仅 4 个核心视图，零复杂前端构建依赖或轻量纯静态）**：
-  1. **系统总览**：展示各状态任务统计与核心 Endpoint 健康度摘要；
-  2. **Endpoint 管理**：查看/编辑 `rate_limit_qps`、`max_concurrency`、`circuit_threshold`、`timeout_ms`；
-  3. **任务与流水时间线**：按 `status` / `endpoint_id` 检索任务，展开单条任务的 `task_attempts` 逐次耗时、HTTP 状态码与响应片段；
-  4. **死信队列批量重放**：勾选或按时间窗筛选 `DEAD_LETTER`，触发 `POST /v1/dlq/replay` 查看重放进度。
-- **可运行验收命令（`scripts/verify_m4.sh`）**：
-  ```bash
-  # 启动全套服务端（内嵌或反向代理 web/ 静态资源）并校验页面可达与接口联调闭环
-  ./scripts/verify_m4.sh
-  ```
-
----
-
-## 九、统一语言与架构决策索引（Glossary & ADR Index）
-
+- [全局编码规范（`CODING_STANDARDS.md`）](../CODING_STANDARDS.md)
+- [Go 代码规范（`docs/standards/go/code.md`）](./standards/go/code.md)
+- [Go 测试规范（`docs/standards/go/testing.md`）](./standards/go/testing.md)
+- [数据库与迁移规范（`docs/standards/database.md`）](./standards/database.md)
+- [记录同步规范（`docs/standards/records.md`）](./standards/records.md)
+- [分阶段演进路线图（`docs/specs/roadmap.md`）](./specs/roadmap.md)
 - [统一语言词表（`GLOSSARY.md`）](../GLOSSARY.md)
 - [ADR-0001: 统一核心业务模型为可靠 HTTP 任务投递引擎](./adr/0001-unified-http-task-delivery-model.md)
 - [ADR-0002: 入口事务一致性采用 PG 同事务 Outbox 与 Go 批量搬运协程](./adr/0002-transactional-outbox-batch-relay.md)

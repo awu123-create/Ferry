@@ -15,7 +15,7 @@
 ## 备选方案对比（Considered Options）
 
 ### 方案 1：PG 同事务 `tasks + outbox` + Go 内置无状态批量 Relay 协程（采纳）
-- 沿用 `x-data` 中 `river.InsertTx` 的“队列载荷与业务真相同事务提交”思想：入口在同一个 PG 事务中写入 `tasks` 与 `outbox`，并在提交后触发 `NOTIFY ferry_outbox`。
+- 沿用单库事务队列“队列载荷与业务真相同事务提交”的设计思想：入口在同一个 PG 事务中写入 `tasks` 与 `outbox`，并在提交后触发 `NOTIFY ferry_outbox`。
 - Go 服务内部启动多个无状态 Outbox Relay 协程，以 `LISTEN/NOTIFY` 瞬时唤醒（辅以 `500ms` 兜底轮询定时器），通过 `SELECT ... FOR UPDATE SKIP LOCKED LIMIT 100` 抢占批次，推入 Kafka 或 Redis ZSet 成功后再直接 `DELETE`。
 
 ### 方案 2：Debezium + Kafka Connect 外部 CDC 链路
@@ -35,12 +35,10 @@
    - 若 `RowsAffected == 0` 命中冲突，回查已有行比对 `payload_sha256`：载荷一致直接返回 `200 OK` 原任务回执，载荷不一致返回 `409 Conflict`；
    - 新建任务成功则在同一事务内写入 `outbox(task_id, deliver_at)`，事务提交后由 `goose` 迁移脚本挂载在 `outbox` 表上的 `AFTER INSERT` 触发器自动执行 `pg_notify('ferry_outbox', '')`，无需业务代码手写通知 SQL。
 2. **双触发批量搬运与分流路由**：
-   - Relay 协程复用底层 `pgx` 连接调用 `WaitForNotification` 监听 `ferry_outbox` 通道，收到通知或 `500ms` 定时器触发后通过 GORM `clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}` 按批拉取（`ORDER BY id ASC LIMIT 100`），直到 `outbox` 排空；
-   - 根据每条记录的 `deliver_at` 与当前时间 `now()` 分流：
-     - **立即任务（`deliver_at <= now()`）**：批量打包写入 Kafka Topic `ferry.tasks.ready`（`acks=all`、分区键为 `endpoint_id` 或 `task_id`），待 Broker 确认后再通过 GORM `Where("id IN ?", batchIDs).Delete(&Outbox{})` 物理删除；
-     - **延迟任务（`deliver_at > now()`）**：通过 Redis Pipeline 批量执行 `ZADD ferry:delayed <deliver_at_ms> <task_id>`，确认成功后再从 `outbox` 删除对应行。
+   - Relay 协程复用底层 `pgx` 连接调用 `WaitForNotification` 监听 `ferry_outbox` 通道，收到通知或 `500ms` 定时器触发后通过 GORM `clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}` 按批拉取，直到 `outbox` 排空；
+   - _演进说明_：初版曾按单通道 `ORDER BY id ASC LIMIT 100` 混取立即/延迟任务且未固定 Kafka 分区键；现行取数协议、复合索引与事务超时统一以 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 为准——拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka，固定以 `task_id` 为分区键，`acks=all` 确认后物理删除）与**延迟通道**（`deliver_at > now()` 通过 Redis Pipeline 批量 `ZADD ferry:delayed` 确认后删除），升级复合索引 `outbox_deliver_idx (deliver_at ASC, id ASC)`，并对单批回调事务绑定 `5s` 硬超时防长事务阻塞 Autovacuum。
 3. **Redis 不可用时的 Relay 隔离保护**：
-   - 当批内同时存在立即任务与延迟任务且 Redis 写入失败时，**立即任务照常推 Kafka 并删除其 `outbox` 行，延迟任务保留在 `outbox` 中回滚锁释放**，等 Redis 恢复或当 `deliver_at` 到期变为立即任务时自然转为直推 Kafka，绝不阻塞立即任务通道。
+   - 当 Redis 不可用时，立即通道照常推 Kafka 并物理删除对应 `outbox` 行，延迟通道独立退避且不阻塞立即通道（见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）；待 Redis 恢复或 `deliver_at` 到期转入立即通道时自动续接。
 
 ## 影响与取舍（Consequences & Trade-offs）
 
@@ -49,4 +47,4 @@
   - 搬运成功即执行物理 `DELETE`（而非软删除 `status='SENT'`），配合 PostgreSQL Autovacuum，使 `outbox` 常驻行数始终接近 0，规避表膨胀；
   - 入口 API 与后台异步化彻底解耦，响应耗时稳定在单次轻量 PG 事务级。
 - **明确取舍**：
-  - 存在极小概率的“已写入 Kafka `acks=all` 但未及执行 `DELETE FROM outbox` 时 Relay 进程崩溃”窗口，恢复后会产生重复投递消息（At-Least-Once），该重复由 Worker 侧 Redis 短锁与 PG 状态机守卫（ADR-0004）幂等消解。
+  - 存在极小概率的“已写入 Kafka `acks=all` 但未及执行 `DELETE FROM outbox` 时 Relay 进程崩溃”窗口，恢复后会产生重复投递消息（At-Least-Once），该重复由 Worker 侧 Redis 执行锁与 PG 复合乐观锁守卫（[ADR-0004](./0004-endpoint-flow-control-and-three-layer-idempotency.md)、[ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）幂等消解。

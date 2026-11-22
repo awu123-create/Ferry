@@ -7,10 +7,10 @@
 
 Ferry 的投递引擎必须支持三类“非立即执行”的时间调度需求：
 1. 用户提交任务时显式指定未来某个任意时刻 `deliver_at`（如 17 分钟后或次日 09:00 执行）；
-2. 下游返回 `5xx` 或超时后的指数退避重试（`base_delay * 2^(attempt-1) + full_jitter`）；
-3. 下游返回 `429 Too Many Requests` 时解析 `Retry-After` 响应头，或触发限流/熔断后动态顺延几秒重试。
+2. 下游返回 `5xx` 或超时后的指数退避重试（初版曾拟定 `2x` 退避，现行小时级退避曲线见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）；
+3. 下游返回 `429 Too Many Requests` 时解析 `Retry-After` 响应头，或触发限流/熔断后动态顺延重试。
 
-Kafka 本质上是面向即时吞吐的顺序追加日志，不支持按任意时间戳投递或单条跳过等待；而如果像 `x-data` 中的 River 那样在高频调度与重试场景下持续对 PostgreSQL 执行 `SELECT ... WHERE scheduled_at <= now()` 与频繁状态更新，高并发重试风暴会导致 PG 索引写放大、锁竞争和 Vacuum 抖动。同时，一旦把倒计时放进内存型组件 Redis，就必须解决“捞出后未发 Kafka 前崩溃丢单”和“Redis 宕机内存清空”两个可靠性死穴。
+Kafka 本质上是面向即时吞吐的顺序追加日志，不支持按任意时间戳投递或单条跳过等待；而如果像同库队列（如 River）那样在高频调度与重试场景下持续对 PostgreSQL 执行 `SELECT ... WHERE scheduled_at <= now()` 与频繁状态更新，高并发重试风暴会导致 PG 索引写放大、锁竞争和 Vacuum 抖动。同时，一旦把倒计时放进内存型组件 Redis，就必须解决“捞出后未发 Kafka 前崩溃丢单”和“Redis 宕机内存清空”两个可靠性死穴。
 
 ## 备选方案对比（Considered Options）
 
@@ -36,23 +36,13 @@ Kafka 本质上是面向即时吞吐的顺序追加日志，不支持按任意�
    - 严禁“先 `ZPOPMIN` 删除再写 Kafka”，否则两步之间进程崩溃即永久丢消息；
    - Forwarder 每 `100ms` 执行 Lua 脚本 `claim_delayed.lua`：
      1. `ZRANGEBYSCORE ferry:delayed -inf <now_ms> LIMIT 0 100` 取出一批到期任务；
-     2. 对该批任务原子执行 `ZADD ferry:delayed XX <now_ms + 30000> <task_id>`（将 `score` 往后推迟 30 秒作为处理租约）；
-     3. 返回该批 `task_id` 给 Go 进程。
-   - Go 进程将这批 `task_id` 批量发往 Kafka `ferry.tasks.ready`（`acks=all`），收到 Broker 确认后再执行 `ZREM ferry:delayed <task_id>...`；
+     2. 对该批任务原子执行 `ZADD ferry:delayed XX <lease_until_ms> <task_id>`（将 `score` 推迟 30 秒作为处理租约）；
+     3. 返回该批 `task_id` 与本次 `lease_until_ms` 给 Go 进程。
+   - Go 进程将这批 `task_id` 批量发往 Kafka `ferry.tasks.ready`（`acks=all`），收到 Broker 确认后再执行确认删除——初版曾直接执行无条件 `ZREM`，现行实现改由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 规定的 Lua 条件删除（仅当 `ZSCORE == lease_until_ms` 时才 `ZREM`），防止误删期间被 Worker 新写入的顺延或退避计划；
    - 若 Forwarder 在写 Kafka 前崩溃或发生网络分区，该批任务在 30 秒租约过期后会自动重新变为到期状态，被其他实例安全捞起。
 3. **PG Reconciler 低频对账自愈（兜底 Redis 极端丢失）**：
-   - 利用 PG `tasks` 表的部分索引 `tasks_reconcile_idx (next_run_at) WHERE status IN ('PENDING', 'RETRYING')`（体积极小，终态行不进索引），每 `60s` 扫描一批到期超过宽限期的卡滞任务：
-     ```sql
-     SELECT id, next_run_at
-     FROM tasks
-     WHERE status IN ('PENDING', 'RETRYING')
-       AND next_run_at < now() - interval '60 seconds'
-     ORDER BY next_run_at ASC
-     LIMIT 500;
-     ```
-   - 对捞出的任务先批量 Pipeline 查询 Redis `EXISTS ferry:lock:task:<id>` 与 `ZSCORE ferry:delayed <id>`：
-     - **若任务仍在 `ferry:delayed` 中等待**（典型原因：Endpoint 熔断或限流顺延了触发时间，Redis 中的时间晚于 PG 记录的 `next_run_at`），则执行 `UPDATE tasks SET next_run_at = to_timestamp(zscore / 1000.0)` 将 PG 对齐到更晚时间，防止同一批合法顺延任务反复占据前 500 扫描名额造成“头部饿死”；
-     - **若任务既无活跃执行锁也不在 `ferry:delayed` 中**（典型原因：Redis 发生故障重启丢内存，或极端写入异常），Reconciler 立即补推该 `task_id` 到 Kafka `ferry.tasks.ready`，并将 PG `next_run_at` 顺延 `30s`（防止下一轮重复补推）。
+   - 利用 PG `tasks` 表的部分索引 `tasks_reconcile_idx (next_run_at ASC, id ASC) WHERE status IN ('PENDING', 'RETRYING')`（体积极小，终态行不进索引），每 `60s` 扫描到期超过宽限期的卡滞任务；
+   - _演进说明_：初版曾按单批 `LIMIT 500` 扫描、发现缺失时直推 Kafka 并篡改 `next_run_at + 30s`；现行对账协议统一以 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 为准——改用 `(next_run_at, id)` 游标循环分批排空全部超期在途行：若任务仍在 `ferry:delayed` 且 Redis 触发时间晚于 PG 记录则对齐 `tasks.next_run_at` 防头部饿死；若既无活跃执行锁也不在 `ferry:delayed` 中，则执行 `ZADD NX ferry:delayed <now_ms> <task_id>` 归口延迟池交由 Forwarder 转发，不再直推 Kafka 或篡改 PG `next_run_at`。
 
 ## 影响与取舍（Consequences & Trade-offs）
 
