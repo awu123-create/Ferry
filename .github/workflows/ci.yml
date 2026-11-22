@@ -54,3 +54,32 @@ jobs:
         run: |
           mkdir -p .build
           go build -v -o .build/ ./cmd/...
+
+  integration:
+    name: Integration Tests (PG + Kafka + Redis)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FERRY_TEST_PG_DSN: postgres://ferry:ferry@localhost:5432/ferry?sslmode=disable
+      FERRY_TEST_REDIS_ADDR: localhost:6379
+      FERRY_TEST_REDIS_DB: "15"
+      FERRY_TEST_KAFKA_BROKERS: localhost:9092
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Start Postgres, Kafka, and Redis
+        run: docker compose -f deploy/docker-compose.yml up -d --wait postgres kafka redis
+
+      - name: Run integration tests
+        run: make test-integration
+
+      - name: Tear down services
+        if: always()
+        run: docker compose -f deploy/docker-compose.yml down -v
