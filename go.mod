@@ -12,6 +12,7 @@ require (
 	github.com/twmb/franz-go/pkg/kadm v1.20.0
 	github.com/twmb/franz-go/pkg/kmsg v1.15.1
 	go.uber.org/zap v1.28.0
+	golang.org/x/sync v0.25.0
 	gorm.io/datatypes v1.2.7
 	gorm.io/driver/postgres v1.6.3
 	gorm.io/gorm v1.31.2
@@ -37,7 +38,6 @@ require (
 	github.com/sethvargo/go-retry v0.5.0 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/sys v0.50.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

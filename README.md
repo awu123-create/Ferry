@@ -88,25 +88,37 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 
 ## 仓库结构与本地开发（Repository Layout & Development）
 
-当前 `main` 分支已落地的工程骨架与规范文档结构（后续 M1 ~ M4 目标目录规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
+当前仓库已落地 Milestone 1 立即投递主链路与工程规范结构（后续 M2 ~ M4 规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
 
 ```text
 Ferry/
+├── .env.example                 # 与 internal/config/config.go 对齐的环境变量示例
 ├── .github/
 │   ├── pull_request_template.md # GitHub PR 正文模板
-│   └── workflows/ci.yml         # GitHub Actions: gofmt、ADR 唯一性、golangci-lint v2、race 单测与二进制构建
-├── .golangci.yml                # golangci-lint v2 静态检查与 depguard 分层依赖门禁
+│   └── workflows/ci.yml         # GitHub Actions: verify（格式/lint/短单测/构建）与 integration（真容器集成测试）
+├── .golangci.yml                # golangci-lint v2 静态检查、depguard 分层与 json_v2 门禁
 ├── .pre-commit-config.yaml      # 本地提交钩子（基础检查、ADR 编号、gofmt、增量 lint、短单测）
 ├── AGENTS.md                    # 场景路由入口（指向工程规范与协作文档）
 ├── CODING_STANDARDS.md          # 全局编码基线（Hard / Judgement / Smell baseline override）
 ├── GLOSSARY.md                  # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
-├── Makefile                     # 基础开发与构建入口 (setup-hooks / fmt / lint / test / build)
+├── Makefile                     # 开发、容器编排、集成测试与验收入口 (setup-hooks / fmt / lint / test / test-integration / up / down / migrate / verify-m1 / build)
 ├── go.mod                       # Go 1.27 模块定义
 ├── cmd/
-│   ├── ferry-server/            # 可执行入口骨架：API 网关与后台调度
-│   ├── ferry-worker/            # 可执行入口骨架：Kafka 消费与出站投递
-│   ├── chaos-receiver/          # 可执行入口骨架：混沌故障注入靶场
-│   └── ferry-bench/             # 可执行入口骨架：并发压测 CLI
+│   ├── ferry-server/            # 组装根：API 网关与 OutboxRelay
+│   ├── ferry-worker/            # 组装根：Kafka 消费、Execution Lock 与 HMAC 签名投递
+│   ├── chaos-receiver/          # 本地验证用下游接收靶场（验签、计数、指定状态码与延迟）
+│   └── ferry-bench/             # 并发压测 CLI 占位入口（Milestone 3）
+├── internal/
+│   ├── domain/                  # 纯 Go 领域核（Endpoint / Task / DeliveryAttempt / 签名与状态机）
+│   ├── api/                     # 入站 HTTP 控制面深模块
+│   ├── scheduler/               # OutboxRelay 发件箱搬运深模块
+│   ├── worker/                  # Step A~E 投递执行与优雅停机深模块
+│   ├── infra/                   # PG / Redis / Kafka / HTTP 出站适配器及真容器测试
+│   └── config/, logger/, metrics/
+├── migrations/                  # Goose SQL 迁移脚本与 embed.go
+├── tests/integration/           # 真实 PG + Kafka + Redis 端到端集成测试
+├── deploy/                      # docker-compose.yml（PostgreSQL 16 / Kafka 3.9 KRaft / Redis 7.4）
+├── scripts/                     # verify_m1.sh 多进程黑盒验收脚本
 └── docs/
     ├── ARCHITECTURE.md          # 架构设计总纲
     ├── adr/                     # ADR 0001 ~ 0008
@@ -115,21 +127,29 @@ Ferry/
     └── standards/               # 分层工程规范（go/code.md、go/testing.md、database.md、records.md）
 ```
 
-### 快速校验（当前工程骨架）
+### 快速校验与本地运行
 
-前置要求：本机已安装 Go 1.27、[`golangci-lint v2`](https://golangci-lint.run/) 与 [`pre-commit`](https://pre-commit.com/)。
+前置要求：本机已安装 Go 1.27、Docker Compose、[`golangci-lint v2`](https://golangci-lint.run/) 与 [`pre-commit`](https://pre-commit.com/)。
 
 ```bash
 # 1. 安装 Git pre-commit 钩子（首次拉取仓库后执行）
 make setup-hooks
 
-# 2. 格式化检查、golangci-lint 静态扫描与竞态单元测试
+# 2. 纯内存快速校验（零容器依赖）
 make fmt
 make lint
 make test
-
-# 3. 编译全部 4 个核心二进制文件至 .build/
 make build
+
+# 3. 启动本机 PG / Kafka / Redis 并运行全量真容器测试
+make up
+make test-integration
+
+# 4. 多进程黑盒验收（Milestone 1）
+make verify-m1
+
+# 5. 停止本机容器
+make down
 ```
 
 ---
@@ -139,7 +159,7 @@ make build
 详细的 Milestone 1 ~ 4 切片边界、端口矩阵与验收规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)（活工单状态与进度统一维护在 GitHub Issues）：
 
 - [x] **Foundation**：架构总纲、统一语言词表（`GLOSSARY.md`）、ADR 0001 ~ 0008、分层工程规范（`CODING_STANDARDS.md` 与 `docs/standards/`）、Go 1.27 工程骨架、`Makefile`、`golangci-lint v2`、`pre-commit` 与 GitHub Actions CI
-- [ ] **Milestone 1**：最小端到端可靠立即直投闭环（Docker Compose、增量初始迁移、幂等入口 API、Outbox 立即通道、`Execution Lock`、Kafka Worker HMAC 签名投递与 `SIGTERM` 优雅停机）
+- [x] **Milestone 1**：最小端到端可靠立即直投链路（Docker Compose、增量初始迁移、幂等入口 API、Outbox 立即通道、`Execution Lock`、Kafka Worker HMAC 签名投递与 `SIGTERM` 优雅停机）
 - [ ] **Milestone 2**：任意未来延迟调度、小时级指数退避与 `Retry-After`、Redis 租约延迟池、PG 游标对账自愈与死信批量重放
 - [ ] **Milestone 3**：Endpoint 三维流控（熔断 / `1/QPS` 虚拟排号 / 并发槽位）、Prometheus + Grafana 可观测闭环与混沌压测
 - [ ] **Milestone 4**：基于 `/v1/*` REST API 的极简只读监控与死信批量重放控制台

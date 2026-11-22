@@ -2,8 +2,6 @@
 
 编写或评审 Go 测试、或决定一条行为归哪一层测时阅读本文件。通用分级与评审口径见 [CODING_STANDARDS.md](../../../CODING_STANDARDS.md)。
 
-> **注**：当前 `main` 分支尚处骨架阶段，下文中 `internal/` 各包测试、`tests/integration/`、`make up`、`make test-integration` 与 `scripts/verify_m*.sh` 随 Milestone 1 切片合入后生效。
-
 ## 基本原则与测试归属（Owners）
 
 一个行为只在拥有它的那一层测一次。写测试前先明确归属层，别的层已经兜住的分支不重复复制。

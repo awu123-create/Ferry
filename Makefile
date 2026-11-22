@@ -1,4 +1,4 @@
-.PHONY: setup-hooks fmt lint test test-integration build up down
+.PHONY: setup-hooks fmt lint test test-integration build up down migrate verify-m1
 
 GOLANGCI_LINT ?= golangci-lint
 BUILD_DIR ?= .build
@@ -29,3 +29,9 @@ up:
 
 down:
 	docker compose -f $(COMPOSE_FILE) down
+
+migrate:
+	go run ./cmd/ferry-server -migrate-only
+
+verify-m1:
+	./scripts/verify_m1.sh
