@@ -8,7 +8,7 @@
 可靠的投递系统不能只把最终成败记成布尔值，必须清晰回答三个工程问题：
 1. 下游返回 `400 Bad Request` 和返回 `503 Service Unavailable` 是否都该无脑重试？状态迁移规则如何防止并发乱序覆盖？
 2. 当下游故障恢复后，积压在死信队列里的上万条任务如果一股脑全部重发，极易瞬间把刚恢复的下游再次打挂（“重放雪崩”），如何做到受控批量重放？
-3. 作为重点展示 Go 后端架构、分布式可靠性与压测调优能力的秋招核心项目，如何在开发周期内合理分配后端可观测性与前端管理页面的精力？
+3. 在以 Go 后端架构、分布式可靠性与压测调优为核心目标的迭代节奏中，如何合理分配后端可观测性与前端管理页面的开发顺序？
 
 ## 备选方案对比（Considered Options）
 
@@ -23,17 +23,16 @@
 采纳 **方案 1**：
 
 ### 一、任务状态机与错误分类规则
-1. **6 个核心状态**：
-   - 非终态：`PENDING`（待立即调度或定时等待）、`RUNNING`（Worker 已准入并正在发送 HTTP）、`RETRYING`（失败后进入退避倒计时等待下次投递）；
-   - 终态：`SUCCEEDED`（收到 `2xx` 响应）、`DEAD_LETTER`（死信）、`CANCELLED`（在投递完成前被用户主动取消）。
+1. **持久化状态模型**：
+   - 初版曾将状态机划分为含 `RUNNING` 在内的 6 个状态；为避免热路径写放大与进程强杀孤儿行，现行持久化状态已由 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 收敛为 **5 个稳态**：非终态 `PENDING`、`RETRYING`，以及终态 `SUCCEEDED`、`DEAD_LETTER`、`CANCELLED`；在途执行状态由 Redis `Execution Lock` 表达，不再写入 PG `RUNNING`。
 2. **严格的 HTTP 响应分类**：
    - `2xx`（200~299）：立即迁移至 `SUCCEEDED`；
-   - `408 Request Timeout`、`429 Too Many Requests`、`5xx`（500~599）、DNS/TCP/TLS/读超时等网络错误：判定为**可重试错误**。若存在有效 `Retry-After` 响应头（仅限 `429`/`503`），优先按其计算下一次调度时间（封顶不超过 `3600s`），否则按指数退避 `min(max_backoff, base * 2^(attempt-1)) + full_jitter`；当 `attempt >= max_attempts` 或当前已超过 `deadline_at` 时落入 `DEAD_LETTER`；
+   - `408 Request Timeout`、`429 Too Many Requests`、`5xx`（500~599）、DNS/TCP/TLS/读超时等网络错误：判定为**可重试错误**。若存在有效 `Retry-After` 响应头（仅限 `429`/`503`），优先按其计算下一次调度时间（封顶不超过 `3600s`），否则按指数退避计算（初版曾拟定 `2x` 退避，现行小时级退避曲线与可配置参数见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）；当 `attempt >= max_attempts` 或已超过 `deadline_at` 时落入 `DEAD_LETTER`；
    - 其余 `4xx`（`400`/`401`/`403`/`404`/`410`/`422` 等）：判定为**不可重试契约/权限错误**，直接落入 `DEAD_LETTER`（记 `last_error = 'NON_RETRYABLE_4XX'`），不浪费重试配额与熔断计数器；
-   - 取消守卫：`POST /v1/tasks/{id}/cancel` 仅允许从 `PENDING` 或 `RETRYING` 迁移至 `CANCELLED`，对已在途 `RUNNING` 或终态请求返回 `409 Conflict`。
+   - 取消守卫：`POST /v1/tasks/{id}/cancel` 先抢占 Redis `Execution Lock` 实现与在途投递真互斥（抢锁失败返回 `409 Conflict`），持锁后再以 PG CAS 从 `PENDING` / `RETRYING` 迁移至 `CANCELLED`（见 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）。
 
 ### 二、投递流水审计（`task_attempts`）与受控死信重放
-1. **独立流水表**：每次实际发出 HTTP 请求（不含 Redis 限流/熔断直接回退）均写入一行 `task_attempts(task_id, attempt_no, http_status, duration_ms, error_kind, error_message, response_snippet, created_at)`，保留完整排查轨迹（响应片段截断至前 `1024` 字节防大包撑爆存储）。
+1. **独立流水表**：每次实际发出 HTTP 请求（不含 Redis 限流/熔断直接回退）均追加写入一行 `task_attempts`（响应片段截断至前 `1024` 字节防大包撑爆存储）；字段含 `replay_count` 轮次列与普通索引 `(task_id, replay_count, attempt_no)`（详见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）。
 2. **单条与分批死信重放**：
    - 单条重放：`POST /v1/tasks/{id}/replay`；
    - 批量重放：`POST /v1/dlq/replay`，支持按 `endpoint_id`、时间范围 `[from, to]` 与每批上限 `limit`（强制封顶 `<= 500`）筛选 `status = 'DEAD_LETTER'` 的任务；
@@ -52,6 +51,6 @@
 - **正向收益**：
   - 死信重放“复用主链路”而非“另写旁路直发脚本”，天然继承限流、熔断与审计日志，架构高度一致；
   - `task_attempts` 采用只追加写（Append-Only），配合部分索引 `tasks_dlq_idx`，查询死信列表不扫描海量成功历史；
-  - 研发重心 100% 对齐 Go 后端、中间件调优与可观测指标，产出可直接用于简历与面试演示的硬核数据曲线。
+  - 研发重心聚焦 Go 后端、中间件调优与可观测指标，产出可量化复现的吞吐、延迟与故障隔离验证曲线。
 - **明确取舍**：
-  - 每次实际投递会多一次 `INSERT INTO task_attempts` 与 `UPDATE tasks` 事务（对常规异步吞吐完全可接受；若未来需要 10 倍以上写扩展，可参考扩展路线将流水异步批量落 ClickHouse 或分区归档，见 `ARCHITECTURE.md`）。
+  - 每次实际投递会多一次 `INSERT INTO task_attempts` 与 `UPDATE tasks` 事务（对常规异步吞吐完全可接受；若未来需要 10 倍以上写扩展，可参考扩展路线将流水异步批量落 ClickHouse 或分区归档，见 [ARCHITECTURE.md](../ARCHITECTURE.md)）。

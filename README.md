@@ -77,7 +77,7 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 
 | 层级 | 选型 | 关键工程配置 |
 | :--- | :--- | :--- |
-| 语言与编译 | `Go 1.27` | 统一锁定 `go.mod` 与 `golangci-lint v2` 工具链版本 |
+| 语言与 JSON | `Go 1.27` + `encoding/json/v2` | 统一锁定 `go.mod` 与 `golangci-lint v2` 工具链版本，业务 JSON 编解码统一采用 `encoding/json/v2` 与 `jsontext` |
 | HTTP 接入与投递 | 标准库 `net/http` | Go 1.22+ 增强 `ServeMux`；手动调优 `http.Transport` 连接池并用 `io.LimitReader` 防大包 OOM |
 | 数据访问与迁移 | `GORM` + `Goose` + `UUIDv7` | DML 归 GORM（`SkipDefaultTransaction`、`clause.OnConflict`/`SKIP LOCKED`），DDL/部分索引/触发器归 `goose`，禁用 `AutoMigrate` |
 | 消息总线与调度 | `twmb/franz-go` + `redis/go-redis/v9` | Kafka 原生幂等生产者与分区 `Pause` 背压；Redis `NewScript` 自动处理 `EVALSHA` 与重启后 `NOSCRIPT` 重载 |
@@ -88,25 +88,31 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 
 ## 仓库结构与本地开发（Repository Layout & Development）
 
+当前 `main` 分支已落地的工程骨架与规范文档结构（后续 M1 ~ M4 目标目录规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
+
 ```text
 Ferry/
-├── .github/workflows/ci.yml   # GitHub Actions: gofmt、ADR 唯一性、golangci-lint v2、race 单测与二进制构建
-├── .golangci.yml              # golangci-lint v2 静态检查与 depguard 分层依赖门禁
-├── .pre-commit-config.yaml    # 本地提交钩子 (基础检查、ADR 编号、gofmt、增量 lint、短单测)
-├── GLOSSARY.md                # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
-├── Makefile                   # 统一开发与构建入口 (setup-hooks / fmt / lint / test / build)
-├── go.mod                     # Go 1.27 模块定义
+├── .github/
+│   ├── pull_request_template.md # GitHub PR 正文模板
+│   └── workflows/ci.yml         # GitHub Actions: gofmt、ADR 唯一性、golangci-lint v2、race 单测与二进制构建
+├── .golangci.yml                # golangci-lint v2 静态检查与 depguard 分层依赖门禁
+├── .pre-commit-config.yaml      # 本地提交钩子（基础检查、ADR 编号、gofmt、增量 lint、短单测）
+├── AGENTS.md                    # 场景路由入口（指向工程规范与协作文档）
+├── CODING_STANDARDS.md          # 全局编码基线（Hard / Judgement / Smell baseline override）
+├── GLOSSARY.md                  # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
+├── Makefile                     # 基础开发与构建入口 (setup-hooks / fmt / lint / test / build)
+├── go.mod                       # Go 1.27 模块定义
 ├── cmd/
-│   ├── ferry-server/          # 组装根：API 网关 + Outbox Relay + Delayed Forwarder + PG Reconciler
-│   ├── ferry-worker/          # 组装根：Kafka 消费 + Redis Lua 准入 + HTTP 签名投递 + 优雅停机
-│   ├── chaos-receiver/        # 混沌故障注入靶场 (模拟延迟 / 500 / 429 / HMAC 验签)
-│   └── ferry-bench/           # 并发压测与多目标隔离性验证 CLI
-├── docs/                      # 架构蓝图 (ARCHITECTURE.md) 与 ADR 0001~0008
-├── internal/                  # 核心领域与深模块包 (domain / api / scheduler / worker / infra/{pg,kafka,redis,httpclient} / config / logger / metrics)
-├── migrations/                # Milestone 1 Goose SQL 迁移脚本与 embed.go (4 张核心表、部分索引与 NOTIFY 触发器)
-├── deploy/                    # Milestone 1~3 Docker Compose、Prometheus 与 Grafana 看板配置
-├── scripts/                   # Milestone 1~4 可重复自动化验收脚本 (verify_m1.sh ~ verify_m4.sh)
-└── web/                       # Milestone 4 极简只读监控与死信批量重放静态控制台
+│   ├── ferry-server/            # 可执行入口骨架：API 网关与后台调度
+│   ├── ferry-worker/            # 可执行入口骨架：Kafka 消费与出站投递
+│   ├── chaos-receiver/          # 可执行入口骨架：混沌故障注入靶场
+│   └── ferry-bench/             # 可执行入口骨架：并发压测 CLI
+└── docs/
+    ├── ARCHITECTURE.md          # 架构设计总纲
+    ├── adr/                     # ADR 0001 ~ 0008
+    ├── agents/                  # Issue tracker、Triage 标签、领域文档与 GitHub 协作规约
+    ├── specs/                   # 演进路线图与切片规划（roadmap.md）
+    └── standards/               # 分层工程规范（go/code.md、go/testing.md、database.md、records.md）
 ```
 
 ### 快速校验（当前工程骨架）
@@ -130,18 +136,23 @@ make build
 
 ## 演进路线图（Roadmap）
 
-- [x] **Foundation**：架构蓝图、统一语言词表（`GLOSSARY.md`）与 ADR 0001~0008 定稿、Go 1.27 工程骨架、`Makefile`、`golangci-lint v2`（含 `depguard` `strict` 白名单分层门禁）、`pre-commit` 与 GitHub Actions CI
-- [ ] **Milestone 1（可靠立即直投闭环）**：Docker Compose 基础设施、Goose 初始表迁移（含 `BYTEA` 保真与复合索引）、幂等入口 API、Outbox 立即通道、`Execution Lock`（防重与取消抢锁互斥）、Kafka Worker HMAC 签名投递与 `SIGTERM` 优雅停机
-- [ ] **Milestone 2（延迟调度、重试与灾难自愈）**：任意未来 `deliver_at`、Redis ZSet `30s` 租约与条件 `ZREM`、可配置小时级指数退避与 `Retry-After`、`60s` PG 游标 Reconciler 回灌自愈、单条与分批死信重放
-- [ ] **Milestone 3（三维流控与混沌压测）**：`admit_endpoint.lua` 熔断/虚拟排号限流/ZSet 并发槽位与 `CompleteDelivery` 对称结算、Prometheus + Grafana 看板、`chaos-receiver` 与 `ferry-bench` 隔离压测验证
-- [ ] **Milestone 4（极简控制台）**：基于公开 `/v1/*` REST API 的概览、Endpoint 配置、`task_attempts` 时间线查看与批量死信重放静态控制台
+详细的 Milestone 1 ~ 4 切片边界、端口矩阵与验收规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)（活工单状态与进度统一维护在 GitHub Issues）：
+
+- [x] **Foundation**：架构总纲、统一语言词表（`GLOSSARY.md`）、ADR 0001 ~ 0008、分层工程规范（`CODING_STANDARDS.md` 与 `docs/standards/`）、Go 1.27 工程骨架、`Makefile`、`golangci-lint v2`、`pre-commit` 与 GitHub Actions CI
+- [ ] **Milestone 1**：最小端到端可靠立即直投闭环（Docker Compose、增量初始迁移、幂等入口 API、Outbox 立即通道、`Execution Lock`、Kafka Worker HMAC 签名投递与 `SIGTERM` 优雅停机）
+- [ ] **Milestone 2**：任意未来延迟调度、小时级指数退避与 `Retry-After`、Redis 租约延迟池、PG 游标对账自愈与死信批量重放
+- [ ] **Milestone 3**：Endpoint 三维流控（熔断 / `1/QPS` 虚拟排号 / 并发槽位）、Prometheus + Grafana 可观测闭环与混沌压测
+- [ ] **Milestone 4**：基于 `/v1/*` REST API 的极简只读监控与死信批量重放控制台
 
 ---
 
-## 架构文档与设计决策（Documentation & ADRs）
+## 架构文档、规范与设计决策（Documentation & ADRs）
 
 - [统一语言词表 (`GLOSSARY.md`)](./GLOSSARY.md)
+- [全局编码规范 (`CODING_STANDARDS.md`)](./CODING_STANDARDS.md)
+- [分层工程规范 (`docs/standards/`)](./docs/standards/go/code.md)（[Go 代码](./docs/standards/go/code.md) · [Go 测试](./docs/standards/go/testing.md) · [数据库与迁移](./docs/standards/database.md) · [记录同步](./docs/standards/records.md)）
 - [架构设计总纲 (`docs/ARCHITECTURE.md`)](./docs/ARCHITECTURE.md)
+- [分阶段演进路线图 (`docs/specs/roadmap.md`)](./docs/specs/roadmap.md)
 - [ADR-0001: 统一核心业务模型为可靠 HTTP 任务投递引擎](./docs/adr/0001-unified-http-task-delivery-model.md)
 - [ADR-0002: 入口事务一致性采用 PG 同事务 Outbox 与 Go 批量搬运协程](./docs/adr/0002-transactional-outbox-batch-relay.md)
 - [ADR-0003: 延迟与退避重试采用 Redis ZSet 租约倒计时池加 PG 对账兜底](./docs/adr/0003-redis-zset-lease-and-pg-reconciler.md)
