@@ -2,6 +2,7 @@ package worker_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -195,6 +196,49 @@ func (l *fakeLocker) isHeld(taskID uuid.UUID) bool {
 	return ok
 }
 
+type scheduledEntry struct {
+	taskID uuid.UUID
+	runAt  time.Time
+}
+
+type contendedEntry struct {
+	taskID        uuid.UUID
+	fallbackDelay time.Duration
+}
+
+type fakeDelayedScheduler struct {
+	mu                 sync.Mutex
+	scheduled          []scheduledEntry
+	contended          []contendedEntry
+	scheduleErr        error
+	deferErr           error
+	lockHeldOnSchedule bool
+	checkLockHeldFn    func(uuid.UUID) bool
+}
+
+func (d *fakeDelayedScheduler) ScheduleDelayed(_ context.Context, taskID uuid.UUID, runAt time.Time) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.checkLockHeldFn != nil {
+		d.lockHeldOnSchedule = d.checkLockHeldFn(taskID)
+	}
+	if d.scheduleErr != nil {
+		return d.scheduleErr
+	}
+	d.scheduled = append(d.scheduled, scheduledEntry{taskID: taskID, runAt: runAt})
+	return nil
+}
+
+func (d *fakeDelayedScheduler) DeferContendedTask(_ context.Context, taskID uuid.UUID, fallbackDelay time.Duration) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.deferErr != nil {
+		return d.deferErr
+	}
+	d.contended = append(d.contended, contendedEntry{taskID: taskID, fallbackDelay: fallbackDelay})
+	return nil
+}
+
 type fakeSender struct {
 	sendFn func(ctx context.Context, req domain.DeliveryRequest) domain.DeliveryResult
 	calls  atomic.Int32
@@ -235,8 +279,11 @@ func mustNewTaskFixture(t *testing.T, enabled bool) (domain.Endpoint, domain.Tas
 }
 
 func TestNewWorker_ConstructorValidation(t *testing.T) {
-	if _, err := worker.NewWorker(zap.NewNop(), nil, newFakeTaskStore(), &fakeEndpointReader{}, newFakeLocker(), &fakeSender{}, worker.Config{}); err == nil {
+	if _, err := worker.NewWorker(zap.NewNop(), nil, newFakeTaskStore(), &fakeEndpointReader{}, newFakeLocker(), &fakeDelayedScheduler{}, &fakeSender{}, worker.Config{}); err == nil {
 		t.Fatal("expected error when ReadyStream is nil")
+	}
+	if _, err := worker.NewWorker(zap.NewNop(), newFakeReadyStream(), newFakeTaskStore(), &fakeEndpointReader{}, newFakeLocker(), nil, &fakeSender{}, worker.Config{}); err == nil {
+		t.Fatal("expected error when DelayedScheduler is nil")
 	}
 }
 
@@ -258,7 +305,7 @@ func TestWorker_ProcessDeliverySuccessLockOrderingAndAudit(t *testing.T) {
 	}
 
 	const lockGrace = 12 * time.Second
-	w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, sender, worker.Config{
+	w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, &fakeDelayedScheduler{}, sender, worker.Config{
 		LockGrace: lockGrace,
 	})
 	if err != nil {
@@ -307,7 +354,7 @@ func TestWorker_ProcessDeliveryNonRetryablePreDisabledAndLockContention(t *testi
 			},
 		}
 
-		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, sender, worker.Config{})
+		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, &fakeDelayedScheduler{}, sender, worker.Config{})
 		if err != nil {
 			t.Fatalf("NewWorker failed: %v", err)
 		}
@@ -329,7 +376,7 @@ func TestWorker_ProcessDeliveryNonRetryablePreDisabledAndLockContention(t *testi
 		endpoints := &fakeEndpointReader{endpoints: map[uuid.UUID]domain.Endpoint{ep.ID: ep}}
 		sender := &fakeSender{}
 
-		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, sender, worker.Config{})
+		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, &fakeDelayedScheduler{}, sender, worker.Config{})
 		if err != nil {
 			t.Fatalf("NewWorker failed: %v", err)
 		}
@@ -344,17 +391,21 @@ func TestWorker_ProcessDeliveryNonRetryablePreDisabledAndLockContention(t *testi
 		}
 	})
 
-	t.Run("lock_contention", func(t *testing.T) {
+	t.Run("lock_contention_defers_and_fails_without_ack", func(t *testing.T) {
 		ep, task := mustNewTaskFixture(t, true)
 		stream := newFakeReadyStream()
 		tasks := newFakeTaskStore()
 		tasks.tasks[task.ID] = task
 		locker := newFakeLocker()
 		locker.held[task.ID] = "other-worker"
+		delayed := &fakeDelayedScheduler{}
 		endpoints := &fakeEndpointReader{endpoints: map[uuid.UUID]domain.Endpoint{ep.ID: ep}}
 		sender := &fakeSender{}
 
-		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, sender, worker.Config{})
+		const fallbackDelay = 3 * time.Second
+		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, delayed, sender, worker.Config{
+			LockFallbackDelay: fallbackDelay,
+		})
 		if err != nil {
 			t.Fatalf("NewWorker failed: %v", err)
 		}
@@ -362,7 +413,63 @@ func TestWorker_ProcessDeliveryNonRetryablePreDisabledAndLockContention(t *testi
 			t.Fatalf("ProcessDelivery failed: %v", err)
 		}
 		if sender.calls.Load() != 0 || len(stream.acked) != 1 {
-			t.Fatalf("expected skip + ack on lock contention, calls=%d acked=%d", sender.calls.Load(), len(stream.acked))
+			t.Fatalf("expected defer + ack on lock contention, calls=%d acked=%d", sender.calls.Load(), len(stream.acked))
+		}
+		if len(delayed.contended) != 1 || delayed.contended[0].taskID != task.ID || delayed.contended[0].fallbackDelay != fallbackDelay {
+			t.Fatalf("expected DeferContendedTask called with fallback=%v, got %+v", fallbackDelay, delayed.contended)
+		}
+
+		// 写 Redis 失败时必须返回错误且不确认消费位移。
+		delayed.deferErr = errors.New("redis down")
+		if err := w.ProcessDelivery(context.Background(), stream.newDelivery(task.ID)); err == nil {
+			t.Fatal("expected error when DeferContendedTask fails")
+		}
+		if len(stream.acked) != 1 {
+			t.Fatalf("expected no ack when DeferContendedTask fails, acked=%d", len(stream.acked))
+		}
+	})
+
+	t.Run("early_arrival_requeues_and_fails_without_ack", func(t *testing.T) {
+		now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+		futureRunAt := now.Add(30 * time.Second)
+		ep, task := mustNewTaskFixture(t, true)
+		task.NextRunAt = futureRunAt
+		task.DeadlineAt = futureRunAt.Add(time.Hour)
+
+		stream := newFakeReadyStream()
+		tasks := newFakeTaskStore()
+		tasks.tasks[task.ID] = task
+		locker := newFakeLocker()
+		delayed := &fakeDelayedScheduler{checkLockHeldFn: locker.isHeld}
+		endpoints := &fakeEndpointReader{endpoints: map[uuid.UUID]domain.Endpoint{ep.ID: ep}}
+		sender := &fakeSender{}
+
+		w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, delayed, sender, worker.Config{
+			Clock: func() time.Time { return now },
+		})
+		if err != nil {
+			t.Fatalf("NewWorker failed: %v", err)
+		}
+		if err := w.ProcessDelivery(context.Background(), stream.newDelivery(task.ID)); err != nil {
+			t.Fatalf("ProcessDelivery(early) failed: %v", err)
+		}
+		if sender.calls.Load() != 0 || len(stream.acked) != 1 {
+			t.Fatalf("expected requeue + ack on early arrival, calls=%d acked=%d", sender.calls.Load(), len(stream.acked))
+		}
+		if len(delayed.scheduled) != 1 || delayed.scheduled[0].taskID != task.ID || !delayed.scheduled[0].runAt.Equal(futureRunAt) {
+			t.Fatalf("expected ScheduleDelayed(%s, %v), got %+v", task.ID, futureRunAt, delayed.scheduled)
+		}
+		if !delayed.lockHeldOnSchedule || locker.isHeld(task.ID) {
+			t.Fatalf("expected lock held during ScheduleDelayed and released afterward, heldDuring=%v heldAfter=%v", delayed.lockHeldOnSchedule, locker.isHeld(task.ID))
+		}
+
+		// 早到写回延迟池失败时必须返回错误且不 Ack。
+		delayed.scheduleErr = errors.New("redis down")
+		if err := w.ProcessDelivery(context.Background(), stream.newDelivery(task.ID)); err == nil {
+			t.Fatal("expected error when ScheduleDelayed fails on early arrival")
+		}
+		if len(stream.acked) != 1 {
+			t.Fatalf("expected no ack when ScheduleDelayed fails, acked=%d", len(stream.acked))
 		}
 	})
 }
@@ -389,7 +496,7 @@ func TestWorker_RunGracefulDrainOnCancel(t *testing.T) {
 		},
 	}
 
-	w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, sender, worker.Config{
+	w, err := worker.NewWorker(zap.NewNop(), stream, tasks, endpoints, locker, &fakeDelayedScheduler{}, sender, worker.Config{
 		Concurrency:          4,
 		LockGrace:            5 * time.Second,
 		ShutdownDrainTimeout: 2 * time.Second,

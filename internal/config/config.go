@@ -18,43 +18,48 @@ const (
 
 // ServerConfig 保存 ferry-server 的 12-Factor 环境变量配置。
 type ServerConfig struct {
-	HTTPAddr             string
-	MetricsAddr          string
-	PostgresDSN          string
-	KafkaBrokers         []string
-	KafkaReadyTopic      string
-	KafkaReadyPartitions int32
-	RedisAddr            string
-	RedisPassword        string
-	RedisDB              int
-	LogLevel             string
-	SlowSQLThreshold     time.Duration
-	DefaultMaxAttempts   int
-	DefaultTaskWindow    time.Duration
-	OutboxBatchSize      int
-	OutboxPollInterval   time.Duration
-	OutboxBatchTimeout   time.Duration
-	MaxPayloadBytes      int
-	ShutdownDrainTimeout time.Duration
+	HTTPAddr                 string
+	MetricsAddr              string
+	PostgresDSN              string
+	KafkaBrokers             []string
+	KafkaReadyTopic          string
+	KafkaReadyPartitions     int32
+	RedisAddr                string
+	RedisPassword            string
+	RedisDB                  int
+	LogLevel                 string
+	SlowSQLThreshold         time.Duration
+	DefaultMaxAttempts       int
+	DefaultTaskWindow        time.Duration
+	OutboxBatchSize          int
+	OutboxPollInterval       time.Duration
+	OutboxBatchTimeout       time.Duration
+	DelayedPollInterval      time.Duration
+	DelayedBatchSize         int
+	DelayedLeaseTTL          time.Duration
+	SchedulerErrorBackoffCap time.Duration
+	MaxPayloadBytes          int
+	ShutdownDrainTimeout     time.Duration
 }
 
 // WorkerConfig 保存 ferry-worker 的 12-Factor 环境变量配置。
 type WorkerConfig struct {
-	ProbeAddr               string
-	MetricsAddr             string
-	PostgresDSN             string
-	KafkaBrokers            []string
-	KafkaReadyTopic         string
-	KafkaGroupID            string
-	RedisAddr               string
-	RedisPassword           string
-	RedisDB                 int
-	LogLevel                string
-	SlowSQLThreshold        time.Duration
-	WorkerConcurrency       int
-	ExecutionLockGrace      time.Duration
-	MaxResponseSnippetBytes int
-	ShutdownDrainTimeout    time.Duration
+	ProbeAddr                  string
+	MetricsAddr                string
+	PostgresDSN                string
+	KafkaBrokers               []string
+	KafkaReadyTopic            string
+	KafkaGroupID               string
+	RedisAddr                  string
+	RedisPassword              string
+	RedisDB                    int
+	LogLevel                   string
+	SlowSQLThreshold           time.Duration
+	WorkerConcurrency          int
+	ExecutionLockGrace         time.Duration
+	ExecutionLockFallbackDelay time.Duration
+	MaxResponseSnippetBytes    int
+	ShutdownDrainTimeout       time.Duration
 }
 
 // ReceiverConfig 保存 chaos-receiver 的 12-Factor 环境变量配置。
@@ -69,24 +74,28 @@ type ReceiverConfig struct {
 // LoadServerConfig 解析并校验 ferry-server 的环境变量配置。
 func LoadServerConfig() (ServerConfig, error) {
 	cfg := ServerConfig{
-		HTTPAddr:             envString("FERRY_HTTP_ADDR", ":8080"),
-		MetricsAddr:          envString("FERRY_METRICS_ADDR", ":2112"),
-		PostgresDSN:          envString("FERRY_PG_DSN", "postgres://ferry:ferry@localhost:5432/ferry?sslmode=disable"),
-		KafkaBrokers:         envCSV("FERRY_KAFKA_BROKERS", []string{"localhost:9092"}),
-		KafkaReadyTopic:      envString("FERRY_KAFKA_READY_TOPIC", "ferry.tasks.ready"),
-		KafkaReadyPartitions: 12,
-		RedisAddr:            envString("FERRY_REDIS_ADDR", "localhost:6379"),
-		RedisPassword:        envString("FERRY_REDIS_PASSWORD", ""),
-		RedisDB:              0,
-		LogLevel:             envString("FERRY_LOG_LEVEL", "info"),
-		SlowSQLThreshold:     200 * time.Millisecond,
-		DefaultMaxAttempts:   1,
-		DefaultTaskWindow:    24 * time.Hour,
-		OutboxBatchSize:      100,
-		OutboxPollInterval:   500 * time.Millisecond,
-		OutboxBatchTimeout:   5 * time.Second,
-		MaxPayloadBytes:      1 << 20,
-		ShutdownDrainTimeout: 25 * time.Second,
+		HTTPAddr:                 envString("FERRY_HTTP_ADDR", ":8080"),
+		MetricsAddr:              envString("FERRY_METRICS_ADDR", ":2112"),
+		PostgresDSN:              envString("FERRY_PG_DSN", "postgres://ferry:ferry@localhost:5432/ferry?sslmode=disable"),
+		KafkaBrokers:             envCSV("FERRY_KAFKA_BROKERS", []string{"localhost:9092"}),
+		KafkaReadyTopic:          envString("FERRY_KAFKA_READY_TOPIC", "ferry.tasks.ready"),
+		KafkaReadyPartitions:     12,
+		RedisAddr:                envString("FERRY_REDIS_ADDR", "localhost:6379"),
+		RedisPassword:            envString("FERRY_REDIS_PASSWORD", ""),
+		RedisDB:                  0,
+		LogLevel:                 envString("FERRY_LOG_LEVEL", "info"),
+		SlowSQLThreshold:         200 * time.Millisecond,
+		DefaultMaxAttempts:       1,
+		DefaultTaskWindow:        24 * time.Hour,
+		OutboxBatchSize:          100,
+		OutboxPollInterval:       500 * time.Millisecond,
+		OutboxBatchTimeout:       5 * time.Second,
+		DelayedPollInterval:      100 * time.Millisecond,
+		DelayedBatchSize:         100,
+		DelayedLeaseTTL:          30 * time.Second,
+		SchedulerErrorBackoffCap: 5 * time.Second,
+		MaxPayloadBytes:          1 << 20,
+		ShutdownDrainTimeout:     25 * time.Second,
 	}
 
 	var err error
@@ -112,6 +121,18 @@ func LoadServerConfig() (ServerConfig, error) {
 		return ServerConfig{}, err
 	}
 	if cfg.OutboxBatchTimeout, err = envDuration("FERRY_OUTBOX_BATCH_TIMEOUT", cfg.OutboxBatchTimeout); err != nil {
+		return ServerConfig{}, err
+	}
+	if cfg.DelayedPollInterval, err = envDuration("FERRY_DELAYED_POLL_INTERVAL", cfg.DelayedPollInterval); err != nil {
+		return ServerConfig{}, err
+	}
+	if cfg.DelayedBatchSize, err = envInt("FERRY_DELAYED_BATCH_SIZE", cfg.DelayedBatchSize); err != nil {
+		return ServerConfig{}, err
+	}
+	if cfg.DelayedLeaseTTL, err = envDuration("FERRY_DELAYED_LEASE_TTL", cfg.DelayedLeaseTTL); err != nil {
+		return ServerConfig{}, err
+	}
+	if cfg.SchedulerErrorBackoffCap, err = envDuration("FERRY_SCHEDULER_ERROR_BACKOFF_CAP", cfg.SchedulerErrorBackoffCap); err != nil {
 		return ServerConfig{}, err
 	}
 	if cfg.MaxPayloadBytes, err = envInt("FERRY_MAX_PAYLOAD_BYTES", cfg.MaxPayloadBytes); err != nil {
@@ -170,6 +191,18 @@ func (c ServerConfig) validate() error {
 	if c.OutboxBatchTimeout <= 0 {
 		return fmt.Errorf("FERRY_OUTBOX_BATCH_TIMEOUT must be > 0")
 	}
+	if c.DelayedPollInterval <= 0 {
+		return fmt.Errorf("FERRY_DELAYED_POLL_INTERVAL must be > 0")
+	}
+	if c.DelayedBatchSize <= 0 {
+		return fmt.Errorf("FERRY_DELAYED_BATCH_SIZE must be > 0")
+	}
+	if c.DelayedLeaseTTL <= 0 {
+		return fmt.Errorf("FERRY_DELAYED_LEASE_TTL must be > 0")
+	}
+	if c.SchedulerErrorBackoffCap <= 0 {
+		return fmt.Errorf("FERRY_SCHEDULER_ERROR_BACKOFF_CAP must be > 0")
+	}
 	if c.MaxPayloadBytes <= 0 {
 		return fmt.Errorf("FERRY_MAX_PAYLOAD_BYTES must be > 0")
 	}
@@ -182,21 +215,22 @@ func (c ServerConfig) validate() error {
 // LoadWorkerConfig 解析并校验 ferry-worker 的环境变量配置。
 func LoadWorkerConfig() (WorkerConfig, error) {
 	cfg := WorkerConfig{
-		ProbeAddr:               envString("FERRY_WORKER_PROBE_ADDR", ":8082"),
-		MetricsAddr:             envString("FERRY_WORKER_METRICS_ADDR", ":2113"),
-		PostgresDSN:             envString("FERRY_PG_DSN", "postgres://ferry:ferry@localhost:5432/ferry?sslmode=disable"),
-		KafkaBrokers:            envCSV("FERRY_KAFKA_BROKERS", []string{"localhost:9092"}),
-		KafkaReadyTopic:         envString("FERRY_KAFKA_READY_TOPIC", "ferry.tasks.ready"),
-		KafkaGroupID:            envString("FERRY_KAFKA_GROUP_ID", "ferry-worker"),
-		RedisAddr:               envString("FERRY_REDIS_ADDR", "localhost:6379"),
-		RedisPassword:           envString("FERRY_REDIS_PASSWORD", ""),
-		RedisDB:                 0,
-		LogLevel:                envString("FERRY_LOG_LEVEL", "info"),
-		SlowSQLThreshold:        200 * time.Millisecond,
-		WorkerConcurrency:       32,
-		ExecutionLockGrace:      15 * time.Second,
-		MaxResponseSnippetBytes: 1024,
-		ShutdownDrainTimeout:    25 * time.Second,
+		ProbeAddr:                  envString("FERRY_WORKER_PROBE_ADDR", ":8082"),
+		MetricsAddr:                envString("FERRY_WORKER_METRICS_ADDR", ":2113"),
+		PostgresDSN:                envString("FERRY_PG_DSN", "postgres://ferry:ferry@localhost:5432/ferry?sslmode=disable"),
+		KafkaBrokers:               envCSV("FERRY_KAFKA_BROKERS", []string{"localhost:9092"}),
+		KafkaReadyTopic:            envString("FERRY_KAFKA_READY_TOPIC", "ferry.tasks.ready"),
+		KafkaGroupID:               envString("FERRY_KAFKA_GROUP_ID", "ferry-worker"),
+		RedisAddr:                  envString("FERRY_REDIS_ADDR", "localhost:6379"),
+		RedisPassword:              envString("FERRY_REDIS_PASSWORD", ""),
+		RedisDB:                    0,
+		LogLevel:                   envString("FERRY_LOG_LEVEL", "info"),
+		SlowSQLThreshold:           200 * time.Millisecond,
+		WorkerConcurrency:          32,
+		ExecutionLockGrace:         15 * time.Second,
+		ExecutionLockFallbackDelay: 5 * time.Second,
+		MaxResponseSnippetBytes:    1024,
+		ShutdownDrainTimeout:       25 * time.Second,
 	}
 
 	var err error
@@ -210,6 +244,9 @@ func LoadWorkerConfig() (WorkerConfig, error) {
 		return WorkerConfig{}, err
 	}
 	if cfg.ExecutionLockGrace, err = envDuration("FERRY_EXECUTION_LOCK_GRACE", cfg.ExecutionLockGrace); err != nil {
+		return WorkerConfig{}, err
+	}
+	if cfg.ExecutionLockFallbackDelay, err = envDuration("FERRY_EXECUTION_LOCK_FALLBACK_DELAY", cfg.ExecutionLockFallbackDelay); err != nil {
 		return WorkerConfig{}, err
 	}
 	if cfg.MaxResponseSnippetBytes, err = envInt("FERRY_MAX_RESPONSE_SNIPPET_BYTES", cfg.MaxResponseSnippetBytes); err != nil {
@@ -258,6 +295,9 @@ func (c WorkerConfig) validate() error {
 	}
 	if c.ExecutionLockGrace <= 0 {
 		return fmt.Errorf("FERRY_EXECUTION_LOCK_GRACE must be > 0")
+	}
+	if c.ExecutionLockFallbackDelay <= 0 {
+		return fmt.Errorf("FERRY_EXECUTION_LOCK_FALLBACK_DELAY must be > 0")
 	}
 	if c.MaxResponseSnippetBytes <= 0 {
 		return fmt.Errorf("FERRY_MAX_RESPONSE_SNIPPET_BYTES must be > 0")

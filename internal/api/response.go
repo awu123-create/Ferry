@@ -11,20 +11,19 @@ import (
 )
 
 const (
-	errCodeNotReady                  = "NOT_READY"
-	errCodeInvalidJSON               = "INVALID_JSON"
-	errCodeInvalidEndpointID         = "INVALID_ENDPOINT_ID"
-	errCodeInvalidTaskID             = "INVALID_TASK_ID"
-	errCodeValidation                = "VALIDATION_ERROR"
-	errCodeFutureDeliveryUnsupported = "FUTURE_DELIVERY_UNSUPPORTED"
-	errCodeEndpointDisabled          = "ENDPOINT_DISABLED"
-	errCodeEndpointNotFound          = "ENDPOINT_NOT_FOUND"
-	errCodeEndpointConflict          = "ENDPOINT_CONFLICT"
-	errCodeTaskNotFound              = "TASK_NOT_FOUND"
-	errCodeIdempotencyConflict       = "IDEMPOTENCY_CONFLICT"
-	errCodeTaskNotCancellable        = "TASK_NOT_CANCELLABLE"
-	errCodeTaskExecutionInFlight     = "TASK_EXECUTION_IN_FLIGHT"
-	errCodeInternal                  = "INTERNAL_ERROR"
+	errCodeNotReady              = "NOT_READY"
+	errCodeInvalidJSON           = "INVALID_JSON"
+	errCodeInvalidEndpointID     = "INVALID_ENDPOINT_ID"
+	errCodeInvalidTaskID         = "INVALID_TASK_ID"
+	errCodeValidation            = "VALIDATION_ERROR"
+	errCodeEndpointDisabled      = "ENDPOINT_DISABLED"
+	errCodeEndpointNotFound      = "ENDPOINT_NOT_FOUND"
+	errCodeEndpointConflict      = "ENDPOINT_CONFLICT"
+	errCodeTaskNotFound          = "TASK_NOT_FOUND"
+	errCodeIdempotencyConflict   = "IDEMPOTENCY_CONFLICT"
+	errCodeTaskNotCancellable    = "TASK_NOT_CANCELLABLE"
+	errCodeTaskExecutionInFlight = "TASK_EXECUTION_IN_FLIGHT"
+	errCodeInternal              = "INTERNAL_ERROR"
 
 	errMsgNotReady = "dependency readiness check failed"
 	errMsgInternal = "internal server error"
@@ -61,8 +60,6 @@ func (h *Handler) writeDomainError(w http.ResponseWriter, err error) {
 		writeErrorJSON(w, http.StatusBadRequest, errCodeValidation, valErr.Error())
 	case errors.Is(err, domain.ErrValidation):
 		h.writeSentinelError(w, http.StatusBadRequest, errCodeValidation, domain.ErrValidation, err)
-	case errors.Is(err, domain.ErrFutureDeliveryUnsupported):
-		h.writeSentinelError(w, http.StatusBadRequest, errCodeFutureDeliveryUnsupported, domain.ErrFutureDeliveryUnsupported, err)
 	case errors.Is(err, domain.ErrEndpointDisabled):
 		h.writeSentinelError(w, http.StatusBadRequest, errCodeEndpointDisabled, domain.ErrEndpointDisabled, err)
 	case errors.Is(err, domain.ErrEndpointNotFound):

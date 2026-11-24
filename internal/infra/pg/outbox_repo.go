@@ -12,6 +12,8 @@ import (
 	"github.com/jackc/pgx/v5/stdlib"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+
+	"github.com/awu123-create/ferry/internal/domain"
 )
 
 const (
@@ -33,6 +35,51 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 	if dispatch == nil {
 		return 0, fmt.Errorf("outbox dispatch callback must not be nil")
 	}
+
+	filter := clause.Lte{Column: clause.Column{Name: "deliver_at"}, Value: now.UTC()}
+	return s.claimAndDispatchOutbox(ctx, filter, limit, func(txCtx context.Context, rows []outboxPO) error {
+		taskIDs := make([]uuid.UUID, 0, len(rows))
+		for _, row := range rows {
+			taskIDs = append(taskIDs, row.TaskID)
+		}
+		return dispatch(txCtx, taskIDs)
+	})
+}
+
+// ClaimAndDispatchDelayedOutbox 在有界事务内通过 FOR UPDATE SKIP LOCKED 抢占最多 limit 条
+// 未来投递（deliver_at > now）的 outbox 记录，调用 dispatch 写入延迟池并在成功后物理删除
+// （详见 docs/adr/0002-transactional-outbox-batch-relay.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
+func (s *Store) ClaimAndDispatchDelayedOutbox(
+	ctx context.Context,
+	now time.Time,
+	limit int,
+	dispatch func(ctx context.Context, items []domain.OutboxItem) error,
+) (int, error) {
+	if dispatch == nil {
+		return 0, fmt.Errorf("outbox dispatch callback must not be nil")
+	}
+
+	// 附加 deliver_at > created_at 守卫：立即任务（deliver_at <= created_at）即使因并发取时钟顺序或跨机偏差
+	// 略晚于 cutoff，也绝不会被延迟通道误抢进 Redis 延迟池。
+	filter := clause.And(
+		clause.Gt{Column: clause.Column{Name: "deliver_at"}, Value: now.UTC()},
+		clause.Gt{Column: clause.Column{Name: "deliver_at"}, Value: clause.Column{Name: "created_at"}},
+	)
+	return s.claimAndDispatchOutbox(ctx, filter, limit, func(txCtx context.Context, rows []outboxPO) error {
+		items := make([]domain.OutboxItem, 0, len(rows))
+		for _, row := range rows {
+			items = append(items, toDomainOutboxItem(row))
+		}
+		return dispatch(txCtx, items)
+	})
+}
+
+func (s *Store) claimAndDispatchOutbox(
+	ctx context.Context,
+	filter clause.Expression,
+	limit int,
+	dispatch func(ctx context.Context, rows []outboxPO) error,
+) (int, error) {
 	if limit <= 0 {
 		limit = defaultOutboxBatchLimit
 	}
@@ -44,38 +91,33 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 		defer cancel()
 	}
 
-	cutoff := now.UTC()
 	var claimed int
 	err := s.db.WithContext(txCtx).Transaction(func(tx *gorm.DB) error {
 		var rows []outboxPO
 		if err := tx.
-			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}).
-			Where("deliver_at <= ?", cutoff).
+			Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}, filter).
 			Order("deliver_at ASC, id ASC").
 			Limit(limit).
 			Find(&rows).Error; err != nil {
-			return fmt.Errorf("claim immediate outbox rows: %w", err)
+			return fmt.Errorf("claim outbox rows: %w", err)
 		}
 		if len(rows) == 0 {
 			return nil
 		}
 
-		taskIDs := make([]uuid.UUID, 0, len(rows))
-		ids := make([]int64, 0, len(rows))
-		for _, row := range rows {
-			taskIDs = append(taskIDs, row.TaskID)
-			ids = append(ids, row.ID)
-		}
-
-		if err := dispatch(txCtx, taskIDs); err != nil {
+		if err := dispatch(txCtx, rows); err != nil {
 			return err
 		}
 
+		ids := make([]int64, 0, len(rows))
+		for _, row := range rows {
+			ids = append(ids, row.ID)
+		}
 		if err := tx.Where("id IN ?", ids).Delete(&outboxPO{}).Error; err != nil {
 			return fmt.Errorf("delete dispatched outbox rows: %w", err)
 		}
 
-		claimed = len(taskIDs)
+		claimed = len(rows)
 		return nil
 	})
 	if err != nil {

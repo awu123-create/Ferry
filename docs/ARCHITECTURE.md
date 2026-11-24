@@ -325,9 +325,9 @@ Ferry/
 ├── cmd/                       # 入口组装根（ferry-server / ferry-worker / chaos-receiver 已实现，ferry-bench 留待 M3）
 ├── internal/
 │   ├── domain/                # 纯 Go 领域核（endpoint / task / delivery / errors）
-│   ├── api/                   # 控制面 REST API、错误脱敏与抢锁取消
-│   ├── scheduler/             # OutboxRelay（LISTEN/NOTIFY + 定时兜底轮询）
-│   ├── worker/                # Step A~E 投递执行与 SIGTERM 优雅停机排空
+│   ├── api/                   # 控制面 REST API、错误脱敏与抢锁取消（含延迟池清理）
+│   ├── scheduler/             # 双通道 OutboxRelay（LISTEN/NOTIFY + 定时兜底）与 DelayedForwarder（30s 租约转发）
+│   ├── worker/                # Step A~E 投递执行、争用/早到延迟池保底回写与 SIGTERM 优雅停机排空
 │   ├── infra/                 # pg / redis / kafka / httpclient 出站适配器与真容器测试
 │   └── config/, logger/, metrics/
 ├── migrations/                # Goose 初始迁移 0001_init.sql 与 embed.go

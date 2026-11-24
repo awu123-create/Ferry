@@ -76,3 +76,9 @@ type ReadyDelivery struct {
 	TaskID uuid.UUID
 	Ack    func()
 }
+
+// OutboxItem 表示待由延迟通道写入延迟调度池的单条发件箱调度记录。
+type OutboxItem struct {
+	TaskID    uuid.UUID
+	DeliverAt time.Time
+}

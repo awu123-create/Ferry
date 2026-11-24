@@ -25,11 +25,12 @@ import (
 )
 
 var (
-	_ worker.ReadyStream     = (*kafka.ReadyReader)(nil)
-	_ worker.TaskStore       = (*pg.Store)(nil)
-	_ worker.EndpointReader  = (*pg.Store)(nil)
-	_ worker.ExecutionLocker = (*redis.Client)(nil)
-	_ worker.HTTPSender      = (*httpclient.Sender)(nil)
+	_ worker.ReadyStream      = (*kafka.ReadyReader)(nil)
+	_ worker.TaskStore        = (*pg.Store)(nil)
+	_ worker.EndpointReader   = (*pg.Store)(nil)
+	_ worker.ExecutionLocker  = (*redis.Client)(nil)
+	_ worker.DelayedScheduler = (*redis.Client)(nil)
+	_ worker.HTTPSender       = (*httpclient.Sender)(nil)
 )
 
 func main() {
@@ -101,10 +102,12 @@ func run() error {
 		pgStore,
 		pgStore,
 		redisClient,
+		redisClient,
 		sender,
 		worker.Config{
 			Concurrency:          cfg.WorkerConcurrency,
 			LockGrace:            cfg.ExecutionLockGrace,
+			LockFallbackDelay:    cfg.ExecutionLockFallbackDelay,
 			ShutdownDrainTimeout: cfg.ShutdownDrainTimeout,
 		},
 	)

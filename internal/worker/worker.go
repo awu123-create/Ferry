@@ -17,17 +17,19 @@ import (
 const (
 	// initialExecutionLockTTL 为 Step A 首次抢锁的短租约，仅覆盖读库与前置守卫；
 	// 读到 Endpoint 后再按 timeout_ms + LockGrace 做验主续期，避免短超时任务白占 75s 锁。
-	initialExecutionLockTTL = 15 * time.Second
-	lockReleaseTimeout      = 5 * time.Second
-	pollErrorBackoff        = 200 * time.Millisecond
-	periodicCommitPeriod    = 500 * time.Millisecond
-	finalCommitTimeout      = 5 * time.Second
+	initialExecutionLockTTL  = 15 * time.Second
+	defaultLockFallbackDelay = 5 * time.Second
+	lockReleaseTimeout       = 5 * time.Second
+	pollErrorBackoff         = 200 * time.Millisecond
+	periodicCommitPeriod     = 500 * time.Millisecond
+	finalCommitTimeout       = 5 * time.Second
 )
 
-// Config 配置 Worker 并发度、执行锁保护余量、优雅停机排空超时与时钟来源。
+// Config 配置 Worker 并发度、执行锁保护余量、抢锁争用兜底时长、优雅停机排空超时与时钟来源。
 type Config struct {
 	Concurrency          int
 	LockGrace            time.Duration
+	LockFallbackDelay    time.Duration
 	ShutdownDrainTimeout time.Duration
 	Clock                func() time.Time
 }
@@ -40,6 +42,7 @@ type Worker struct {
 	tasks     TaskStore
 	endpoints EndpointReader
 	locker    ExecutionLocker
+	delayed   DelayedScheduler
 	sender    HTTPSender
 	cfg       Config
 	ready     atomic.Bool
@@ -52,6 +55,7 @@ func NewWorker(
 	tasks TaskStore,
 	endpoints EndpointReader,
 	locker ExecutionLocker,
+	delayed DelayedScheduler,
 	sender HTTPSender,
 	cfg Config,
 ) (*Worker, error) {
@@ -67,6 +71,9 @@ func NewWorker(
 	if locker == nil {
 		return nil, fmt.Errorf("worker requires an ExecutionLocker")
 	}
+	if delayed == nil {
+		return nil, fmt.Errorf("worker requires a DelayedScheduler")
+	}
 	if sender == nil {
 		return nil, fmt.Errorf("worker requires an HTTPSender")
 	}
@@ -78,6 +85,9 @@ func NewWorker(
 	}
 	if cfg.LockGrace <= 0 {
 		cfg.LockGrace = 15 * time.Second
+	}
+	if cfg.LockFallbackDelay <= 0 {
+		cfg.LockFallbackDelay = defaultLockFallbackDelay
 	}
 	if cfg.ShutdownDrainTimeout <= 0 {
 		cfg.ShutdownDrainTimeout = 25 * time.Second
@@ -92,6 +102,7 @@ func NewWorker(
 		tasks:     tasks,
 		endpoints: endpoints,
 		locker:    locker,
+		delayed:   delayed,
 		sender:    sender,
 		cfg:       cfg,
 	}, nil
@@ -226,13 +237,17 @@ func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDeliv
 		return fmt.Errorf("acquire execution lock: %w", err)
 	}
 	if !acquired {
-		// 另一个 Worker 或 Cancel API 正持有该任务锁；Milestone 2 会在此处补充 ZADD NX 保底写入 ferry:delayed 后再 Ack。
-		w.log.Debug("execution lock held by another owner; skipping duplicate delivery", zap.String("task_id", delivery.TaskID.String()))
+		// 另一个 Worker 或 Cancel API 正持有该任务锁：以原子脚本按剩余锁 PTTL（兜底 LockFallbackDelay）执行 ZADD NX 后再 Ack
+		// （详见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
+		if deferErr := w.delayed.DeferContendedTask(ctx, delivery.TaskID, w.cfg.LockFallbackDelay); deferErr != nil {
+			return fmt.Errorf("defer contended task: %w", deferErr)
+		}
+		w.log.Debug("execution lock held by another owner; deferred wake-up and acknowledged delivery", zap.String("task_id", delivery.TaskID.String()))
 		ackDelivery(delivery)
 		return nil
 	}
 	defer func() {
-		// 必须在 PG 结算事务提交之后才通过 Lua 验主释放执行锁（ADR-0008 §3.1）。
+		// 必须在 PG 结算事务提交之后才通过 Lua 验主释放执行锁（详见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockReleaseTimeout)
 		defer cancel()
 		if relErr := w.locker.ReleaseExecutionLock(releaseCtx, delivery.TaskID, token); relErr != nil {
@@ -277,8 +292,20 @@ func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDeliv
 	if err != nil {
 		return fmt.Errorf("evaluate pre-delivery guard: %w", err)
 	}
-	if decision.AlreadyFinal || decision.EarlyArrival {
-		// Milestone 2 在 EarlyArrival 时会先保底 ZADD 回延迟池再 Ack。
+	if decision.AlreadyFinal {
+		ackDelivery(delivery)
+		return nil
+	}
+	if decision.EarlyArrival {
+		// 持有 Execution Lock 时早到拦截须覆写 ZADD 写回 NextRunAt，防止被 Forwarder 条件删除误清后再 Ack。
+		if schedErr := w.delayed.ScheduleDelayed(ctx, task.ID, task.NextRunAt); schedErr != nil {
+			return fmt.Errorf("requeue early-arrival task: %w", schedErr)
+		}
+		w.log.Debug(
+			"task arrived before next_run_at; requeued to delayed pool",
+			zap.String("task_id", task.ID.String()),
+			zap.Time("next_run_at", task.NextRunAt),
+		)
 		ackDelivery(delivery)
 		return nil
 	}

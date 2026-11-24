@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	defaultTestRedisAddr = "localhost:6379"
-	defaultTestRedisDB   = 15
+	defaultTestRedisAddr   = "localhost:6379"
+	defaultTestRedisUnitDB = 14
 )
 
 func openTestRedis(t *testing.T) *redis.Client {
@@ -29,11 +29,11 @@ func openTestRedis(t *testing.T) *redis.Client {
 		addr = defaultTestRedisAddr
 	}
 	password := os.Getenv("FERRY_TEST_REDIS_PASSWORD")
-	db := defaultTestRedisDB
-	if rawDB := strings.TrimSpace(os.Getenv("FERRY_TEST_REDIS_DB")); rawDB != "" {
+	db := defaultTestRedisUnitDB
+	if rawDB := strings.TrimSpace(os.Getenv("FERRY_TEST_REDIS_UNIT_DB")); rawDB != "" {
 		parsed, err := strconv.Atoi(rawDB)
 		if err != nil {
-			t.Fatalf("invalid FERRY_TEST_REDIS_DB %q: %v", rawDB, err)
+			t.Fatalf("invalid FERRY_TEST_REDIS_UNIT_DB %q: %v", rawDB, err)
 		}
 		db = parsed
 	}

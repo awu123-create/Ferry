@@ -22,8 +22,6 @@ var (
 	ErrTaskNotCancellable = errors.New("task cannot be cancelled")
 	// ErrTaskExecutionInFlight 表示另一个 Worker 正在持有该 Task 的 Execution Lock（执行互斥锁）。
 	ErrTaskExecutionInFlight = errors.New("task execution is in flight")
-	// ErrFutureDeliveryUnsupported 表示 Milestone 1 暂不支持未来时间的 deliver_at。
-	ErrFutureDeliveryUnsupported = errors.New("future deliver_at is not supported in milestone 1")
 )
 
 // ValidationError 携带字段级校验失败上下文，并包装 ErrValidation。

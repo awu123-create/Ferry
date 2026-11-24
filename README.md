@@ -88,7 +88,7 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 
 ## 仓库结构与本地开发（Repository Layout & Development）
 
-当前仓库已落地 Milestone 1 立即投递主链路与工程规范结构（后续 M2 ~ M4 规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
+当前仓库已落地 Milestone 1 立即投递主链路与 Milestone 2 定时投递、双通道 Outbox 及 Redis 延迟池租约转发切片（后续规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
 
 ```text
 Ferry/
@@ -104,14 +104,14 @@ Ferry/
 ├── Makefile                     # 开发、校验、容器编排与验收入口 (setup-hooks / fmt / fmt-check / check-adr / check-scripts / lint / test / test-integration / up / down / migrate / verify-m1 / build)
 ├── go.mod                       # Go 1.27 模块定义
 ├── cmd/
-│   ├── ferry-server/            # 组装根：API 网关与 OutboxRelay
-│   ├── ferry-worker/            # 组装根：Kafka 消费、Execution Lock 与 HMAC 签名投递
+│   ├── ferry-server/            # 组装根：API 网关、双通道 OutboxRelay 与 DelayedForwarder
+│   ├── ferry-worker/            # 组装根：Kafka 消费、Execution Lock、延迟池保底回写与 HMAC 签名投递
 │   ├── chaos-receiver/          # 本地验证用下游接收靶场（验签、计数、指定状态码与延迟）
 │   └── ferry-bench/             # 并发压测 CLI 占位入口（Milestone 3）
 ├── internal/
 │   ├── domain/                  # 纯 Go 领域核（Endpoint / Task / DeliveryAttempt / 签名与状态机）
 │   ├── api/                     # 入站 HTTP 控制面深模块
-│   ├── scheduler/               # OutboxRelay 发件箱搬运深模块
+│   ├── scheduler/               # 双通道 OutboxRelay 与 DelayedForwarder 延迟池租约转发深模块
 │   ├── worker/                  # Step A~E 投递执行与优雅停机深模块
 │   ├── infra/                   # PG / Redis / Kafka / HTTP 出站适配器及真容器测试
 │   └── config/, logger/, metrics/

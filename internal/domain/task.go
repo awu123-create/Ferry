@@ -17,6 +17,8 @@ const (
 	// MinTaskMaxAttempts 与 MaxTaskMaxAttempts 定义 Task.MaxAttempts 的合法闭区间（与数据库 CHECK 约束一致）。
 	MinTaskMaxAttempts = 1
 	MaxTaskMaxAttempts = 20
+	// maxFutureDeliveryWindow 限制创建 Task 时允许预约的最远未来投递跨度（闭区间，防误传时间戳长期占池）。
+	maxFutureDeliveryWindow = 30 * 24 * time.Hour
 	// EarlyArrivalClockSkewTolerance 容忍跨机器间小幅时钟偏差，避免刚创建的立即任务被 Worker 误判为早到。
 	EarlyArrivalClockSkewTolerance = 1 * time.Second
 )
@@ -131,14 +133,14 @@ type OutcomeTransition struct {
 
 // NewTask 校验任务创建不变量并初始化 PENDING 状态的 Task。
 //
-// 契约要求（Milestone 1 核心逻辑）：
+// 契约要求：
 //  1. 要求 params.Endpoint.Enabled == true（否则返回 ErrEndpointDisabled）。
 //  2. 要求去除首尾空白后的 IdempotencyKey 非空（否则返回 NewValidationError("idempotency_key", ...)）。
 //  3. 要求 len(RawPayload) > 0 且满足合法 JSON 语法，但严禁重新序列化（原样保留原始字节切片）。
-//  4. 在 Milestone 1 中，若 params.DeliverAt 非空且 params.DeliverAt.After(params.Now)，
-//     返回 ErrFutureDeliveryUnsupported（ADR-0008 §5.1）。
+//  4. 若 params.DeliverAt 非空且晚于 params.Now + 30 天（闭区间），
+//     返回 NewValidationError("deliver_at", ...)；早于或等于 params.Now 按立即投递处理。
 //  5. 要求 MaxAttempts 位于 [1, 20]；NextRunAt 默认取 DeliverAt（或 Now），
-//     DeadlineAt 为 nil 时默认取 NextRunAt + DefaultWindow（非 nil 时校验 DeadlineAt.After(NextRunAt)）。
+//     DeadlineAt 为 nil 时默认取 max(NextRunAt, Now) + DefaultWindow（非 nil 时校验同时晚于 NextRunAt 与 Now）。
 //  6. 为 Task.ID 生成 UUIDv7，通过 ComputePayloadSHA256(RawPayload) 计算 PayloadSHA256，
 //     设置 Status = TaskStatusPending、Attempt = 0、ReplayCount = 0。
 func NewTask(params NewTaskParams) (Task, error) {
@@ -167,8 +169,8 @@ func NewTask(params NewTaskParams) (Task, error) {
 	nextRunAt := now
 	if params.DeliverAt != nil {
 		deliverAt := params.DeliverAt.UTC()
-		if deliverAt.After(now) {
-			return Task{}, ErrFutureDeliveryUnsupported
+		if deliverAt.After(now.Add(maxFutureDeliveryWindow)) {
+			return Task{}, NewValidationError("deliver_at", "must be within 30 days from now")
 		}
 		nextRunAt = deliverAt
 	}

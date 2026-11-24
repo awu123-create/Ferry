@@ -32,17 +32,19 @@ type Handler struct {
 	endpoints EndpointStore
 	tasks     TaskStore
 	locker    ExecutionLocker
+	delayed   DelayedRemover
 	probes    []ReadinessProbe
 	cfg       HandlerConfig
 	mux       *http.ServeMux
 }
 
-// NewHandler 构造 HTTP 控制面处理器并注册全部 Milestone 1 路由。
+// NewHandler 构造 HTTP 控制面处理器并注册全部路由。
 func NewHandler(
 	log *zap.Logger,
 	endpoints EndpointStore,
 	tasks TaskStore,
 	locker ExecutionLocker,
+	delayed DelayedRemover,
 	probes []ReadinessProbe,
 	cfg HandlerConfig,
 ) (*Handler, error) {
@@ -54,6 +56,9 @@ func NewHandler(
 	}
 	if locker == nil {
 		return nil, fmt.Errorf("api handler requires an ExecutionLocker")
+	}
+	if delayed == nil {
+		return nil, fmt.Errorf("api handler requires a DelayedRemover")
 	}
 	if log == nil {
 		log = zap.NewNop()
@@ -79,6 +84,7 @@ func NewHandler(
 		endpoints: endpoints,
 		tasks:     tasks,
 		locker:    locker,
+		delayed:   delayed,
 		probes:    probes,
 		cfg:       cfg,
 		mux:       http.NewServeMux(),

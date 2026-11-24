@@ -61,7 +61,7 @@
 
 ## 出站调用（Outbound calls）
 
-- 禁止在 PostgreSQL 数据库事务内发起外部 HTTP 请求或不可控外部调用（Outbox 回调推 Kafka 是绑定 `5s` 硬超时的唯一特例）。
+- 禁止在 PostgreSQL 数据库事务内发起外部 HTTP 请求或不可控外部调用（Outbox 双通道回调推 Kafka 或写 Redis 延迟池是绑定 `5s` 硬超时的特例）。
 - 所有出站 HTTP 投递统一走 `internal/infra/httpclient.Sender`：必须携带带超时的 `ctx`、禁用自动跟随 3xx 重定向（`CheckRedirect` 返回 `http.ErrUseLastResponse`）、响应体用有界 `io.LimitReader` 截断防 OOM 并确保 `resp.Body.Close()`、单次尝试不内置重试、过滤上游透传的 `Host` 与 `X-Ferry-*` 保留头。
 
 ## 日志与指标（Logging and metrics）

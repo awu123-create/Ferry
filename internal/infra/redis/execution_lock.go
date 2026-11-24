@@ -65,10 +65,7 @@ func (c *Client) ExtendExecutionLock(ctx context.Context, taskID uuid.UUID, toke
 		return false, fmt.Errorf("execution lock ttl must be > 0")
 	}
 
-	ttlMs := ttl.Milliseconds()
-	if ttlMs <= 0 {
-		ttlMs = 1
-	}
+	ttlMs := durationToPositiveMillis(ttl)
 
 	res, err := extendLockScript.Run(ctx, c.rdb, []string{executionLockKey(taskID)}, token, ttlMs).Int()
 	if err != nil {

@@ -476,3 +476,125 @@ func TestStore_UpdateEndpointOptimisticLock(t *testing.T) {
 		t.Fatalf("expected ErrEndpointNotFound for missing endpoint, got %v", err)
 	}
 }
+
+func TestStore_OutboxDualChannelIsolationAndDueTakeover(t *testing.T) {
+	store := openIsolatedStore(t)
+	ctx := context.Background()
+	ep := mustCreateTestEndpoint(t, store, "dual-channel")
+
+	baseNow := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	immDeliverAt := baseNow.Add(-time.Second)
+	shortFuture := baseNow.Add(5 * time.Second)
+	farFuture := baseNow.Add(2 * time.Minute)
+
+	createTask := func(key string, deliverAt time.Time) domain.Task {
+		t.Helper()
+		task, err := domain.NewTask(domain.NewTaskParams{
+			Endpoint:       ep,
+			IdempotencyKey: key,
+			RawPayload:     []byte(`{"k":1}`),
+			DeliverAt:      &deliverAt,
+			MaxAttempts:    1,
+			DefaultWindow:  time.Hour,
+			Now:            baseNow,
+		})
+		if err != nil {
+			t.Fatalf("NewTask(%s) failed: %v", key, err)
+		}
+		res, err := store.CreateTaskIdempotent(ctx, task)
+		if err != nil {
+			t.Fatalf("CreateTaskIdempotent(%s) failed: %v", key, err)
+		}
+		return res.Task
+	}
+
+	immTask := createTask("imm-1", immDeliverAt)
+	shortTask := createTask("short-future-1", shortFuture)
+	farTask := createTask("far-future-1", farFuture)
+
+	// 1. 延迟通道报错回滚（模拟 Redis 不可用）期间，立即通道仍可独立搬运并物理删除立即行，互不阻塞。
+	redisBoom := errors.New("redis unavailable")
+	if _, err := store.ClaimAndDispatchDelayedOutbox(ctx, baseNow, 10, func(_ context.Context, items []domain.OutboxItem) error {
+		if len(items) != 2 {
+			t.Errorf("expected 2 delayed outbox items, got %d", len(items))
+		}
+		return redisBoom
+	}); !errors.Is(err, redisBoom) {
+		t.Fatalf("expected delayed dispatch error propagated, got %v", err)
+	}
+
+	var gotImm []uuid.UUID
+	claimedImm, err := store.ClaimAndDispatchImmediateOutbox(ctx, baseNow, 10, func(_ context.Context, ids []uuid.UUID) error {
+		gotImm = append(gotImm, ids...)
+		return nil
+	})
+	if err != nil || claimedImm != 1 || len(gotImm) != 1 || gotImm[0] != immTask.ID {
+		t.Fatalf("expected immediate channel to claim [%s], got count=%d ids=%v err=%v", immTask.ID, claimedImm, gotImm, err)
+	}
+
+	// 2. 时间推进至 shortFuture 之后：此前滞留的 shortTask 自动由立即通道接管，farTask 仍由延迟通道领取。
+	afterShort := shortFuture.Add(time.Second)
+	var takeoverIDs []uuid.UUID
+	claimedTakeover, err := store.ClaimAndDispatchImmediateOutbox(ctx, afterShort, 10, func(_ context.Context, ids []uuid.UUID) error {
+		takeoverIDs = append(takeoverIDs, ids...)
+		return nil
+	})
+	if err != nil || claimedTakeover != 1 || len(takeoverIDs) != 1 || takeoverIDs[0] != shortTask.ID {
+		t.Fatalf("expected immediate channel takeover [%s], got count=%d ids=%v err=%v", shortTask.ID, claimedTakeover, takeoverIDs, err)
+	}
+
+	var delayedItems []domain.OutboxItem
+	claimedDelayed, err := store.ClaimAndDispatchDelayedOutbox(ctx, afterShort, 10, func(_ context.Context, items []domain.OutboxItem) error {
+		delayedItems = append(delayedItems, items...)
+		return nil
+	})
+	if err != nil || claimedDelayed != 1 || len(delayedItems) != 1 {
+		t.Fatalf("expected delayed channel to claim 1 item, got count=%d items=%+v err=%v", claimedDelayed, delayedItems, err)
+	}
+	if delayedItems[0].TaskID != farTask.ID || !delayedItems[0].DeliverAt.Equal(farFuture) {
+		t.Fatalf("unexpected delayed outbox item: got %+v want task=%s deliver_at=%v", delayedItems[0], farTask.ID, farFuture)
+	}
+
+	// 3. 回归验证：新建立即任务（deliver_at == created_at）即使因并发或时钟偏差晚于延迟通道 cutoff，
+	// 也不得被延迟通道误抢进延迟池，必须保留给立即通道。
+	skewedNow := afterShort.Add(5 * time.Minute)
+	skewedImm, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: "skewed-immediate-1",
+		RawPayload:     []byte(`{"k":2}`),
+		MaxAttempts:    1,
+		DefaultWindow:  time.Hour,
+		Now:            skewedNow,
+	})
+	if err != nil {
+		t.Fatalf("NewTask(skewedImm) failed: %v", err)
+	}
+	if _, err := store.CreateTaskIdempotent(ctx, skewedImm); err != nil {
+		t.Fatalf("CreateTaskIdempotent(skewedImm) failed: %v", err)
+	}
+	stolen, err := store.ClaimAndDispatchDelayedOutbox(ctx, skewedNow.Add(-50*time.Millisecond), 10, func(_ context.Context, _ []domain.OutboxItem) error {
+		t.Fatal("delayed channel must not claim immediate task under clock skew")
+		return nil
+	})
+	if err != nil || stolen != 0 {
+		t.Fatalf("expected 0 stolen immediate rows, got stolen=%d err=%v", stolen, err)
+	}
+	claimedSkewed, err := store.ClaimAndDispatchImmediateOutbox(ctx, skewedNow, 10, func(_ context.Context, ids []uuid.UUID) error {
+		if len(ids) != 1 || ids[0] != skewedImm.ID {
+			t.Errorf("expected immediate channel to claim [%s], got %v", skewedImm.ID, ids)
+		}
+		return nil
+	})
+	if err != nil || claimedSkewed != 1 {
+		t.Fatalf("expected immediate channel to claim skewed immediate task, got count=%d err=%v", claimedSkewed, err)
+	}
+
+	// 4. 两条通道均已排空。
+	remImm, err := store.ClaimAndDispatchImmediateOutbox(ctx, skewedNow.Add(time.Hour), 10, func(_ context.Context, _ []uuid.UUID) error {
+		t.Fatal("unexpected remaining immediate outbox item")
+		return nil
+	})
+	if err != nil || remImm != 0 {
+		t.Fatalf("expected empty outbox, got remImm=%d err=%v", remImm, err)
+	}
+}
