@@ -299,10 +299,10 @@ CREATE TRIGGER outbox_notify_trg
 
 ### 7.3 工程化质量门禁
 
-- **`Makefile`**：统一封装 `setup-hooks`、`fmt`、`lint`、`test`（`-short` 无容器快测）、`test-integration`（全量真容器测试）、`up`、`down`、`migrate`、`verify-m1` 与 `build`；
-- **`.golangci.yml`（v2）**：强制开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`、`noctx`、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint` 与 `depguard`（包含全局 `json_v2` 规则禁止旧 `encoding/json`，并对 `domain` 与 `{api,scheduler,worker}` 启用 `strict` 白名单门禁，锁死零跨层越界依赖）；
-- **`.pre-commit-config.yaml`**：基础文本/YAML/私钥检查、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、`golangci-lint` 增量扫描与 `go test -short ./...`；
-- **GitHub Actions CI（`.github/workflows/ci.yml`）**：并行运行 `verify`（格式、ADR 编号、全量 lint、竞态短单测与二进制构建）与 `integration`（拉起 `deploy/docker-compose.yml` 真实 PG/Kafka/Redis 容器执行 `make test-integration`），与仓库 `Protect main` 规则集保持一致。
+- **`Makefile`**：统一封装 `setup-hooks`、`fmt`、`fmt-check`、`check-adr`、`check-scripts`、`lint`、`test`（`-short` 无容器快测）、`test-integration`（全量真容器测试）、`up`、`down`、`migrate`、`verify-m1` 与 `build`；
+- **`.golangci.yml`（v2）**：强制开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`、`noctx`、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint`、`usestdlibvars`、`testpackage`、`forbidigo`（禁止 `internal/{domain,infra/pg}` 生产代码裸调 `time.Now`）与 `depguard`（包含全局 `json_v2` 规则禁止旧 `encoding/json`，并对 `domain` 与 `{api,scheduler,worker}` 启用 `strict` 白名单门禁，锁死零跨层越界依赖）；
+- **`.pre-commit-config.yaml`**：基础文本/YAML/私钥检查、`shellcheck`（`shellcheck-py`）与 `bash -n` 脚本校验、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、监听 `.golangci.yml` 的全量 `make lint`、`golangci-lint` 增量扫描与 `go test -short ./...`；
+- **GitHub Actions CI（`.github/workflows/ci.yml`）**：并行运行 `verify`（复用 `Makefile` 执行格式、ADR 编号、脚本 `shellcheck`、全量 lint、竞态短单测与二进制构建）与 `integration`（拉起 `deploy/docker-compose.yml` 真实 PG/Kafka/Redis 容器依次执行 `make test-integration` 与 `timeout 120 env SKIP_TESTS=1 make verify-m1`），与仓库 `Protect main` 规则集保持一致。
 
 ---
 
@@ -320,8 +320,8 @@ Ferry/
 ├── README.md                  # 项目概览与快速校验说明
 ├── go.mod                     # Go 1.27 模块定义
 ├── .github/                   # GitHub Actions CI (ci.yml) 与 PR 模板 (pull_request_template.md)
-├── .golangci.yml              # golangci-lint v2 静态检查、depguard 分层与 json_v2 门禁
-├── .pre-commit-config.yaml    # 本地提交钩子（基础检查、ADR 编号、gofmt、增量 lint、短单测）
+├── .golangci.yml              # golangci-lint v2 静态检查、depguard 分层、json_v2、usestdlibvars、testpackage 与 forbidigo 门禁
+├── .pre-commit-config.yaml    # 本地提交钩子（基础检查、shellcheck/bash-n、ADR 编号、gofmt、配置全量 lint、增量 lint、短单测）
 ├── cmd/                       # 入口组装根（ferry-server / ferry-worker / chaos-receiver 已实现，ferry-bench 留待 M3）
 ├── internal/
 │   ├── domain/                # 纯 Go 领域核（endpoint / task / delivery / errors）

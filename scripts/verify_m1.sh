@@ -10,6 +10,10 @@ REDIS_ADDR="${FERRY_REDIS_ADDR:-localhost:6379}"
 SERVER_URL="${FERRY_SERVER_URL:-http://127.0.0.1:8080}"
 RECEIVER_URL="${FERRY_RECEIVER_URL:-http://127.0.0.1:8081}"
 WORKER_URL="${FERRY_WORKER_URL:-http://127.0.0.1:8082}"
+RUN_ID="$(date +%s)-$$"
+KAFKA_READY_TOPIC="${FERRY_KAFKA_READY_TOPIC:-ferry.verify.m1.ready.${RUN_ID}}"
+KAFKA_GROUP_ID="${FERRY_KAFKA_GROUP_ID:-ferry-verify-m1-${RUN_ID}}"
+SKIP_TESTS="${SKIP_TESTS:-0}"
 
 PIDS=()
 LOG_DIR="$(mktemp -d)"
@@ -17,7 +21,7 @@ LOG_DIR="$(mktemp -d)"
 cleanup() {
   local code=$?
   for pid in "${PIDS[@]:-}"; do
-    if kill -0 "$pid" >/dev/null 2>&1; then
+    if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
       kill -TERM "$pid" >/dev/null 2>&1 || true
       wait "$pid" >/dev/null 2>&1 || true
     fi
@@ -52,14 +56,18 @@ wait_http() {
 echo "[1/6] Starting Docker Compose dependencies..."
 docker compose -f deploy/docker-compose.yml up -d --wait
 
-echo "[2/6] Running race unit tests and building binaries..."
-go test -race -count=1 ./...
+if [ "$SKIP_TESTS" = "1" ]; then
+  echo "[2/6] Skipping go test (SKIP_TESTS=1) and building binaries..."
+else
+  echo "[2/6] Running race unit tests and building binaries..."
+  go test -race -count=1 ./...
+fi
 make build
 
 echo "[3/6] Applying Goose database migrations..."
 FERRY_PG_DSN="$PG_DSN" ./.build/ferry-server -migrate-only
 
-echo "[4/6] Launching chaos-receiver (:8081), ferry-server (:8080), and ferry-worker (:8082)..."
+echo "[4/6] Launching chaos-receiver (:8081), ferry-server (:8080), and ferry-worker (:8082) [topic=$KAFKA_READY_TOPIC, group=$KAFKA_GROUP_ID]..."
 FERRY_RECEIVER_ADDR=":8081" \
   ./.build/chaos-receiver >"$LOG_DIR/chaos-receiver.log" 2>&1 &
 PIDS+=($!)
@@ -68,21 +76,25 @@ FERRY_HTTP_ADDR=":8080" \
 FERRY_METRICS_ADDR=":2112" \
 FERRY_PG_DSN="$PG_DSN" \
 FERRY_KAFKA_BROKERS="$KAFKA_BROKERS" \
+FERRY_KAFKA_READY_TOPIC="$KAFKA_READY_TOPIC" \
 FERRY_REDIS_ADDR="$REDIS_ADDR" \
   ./.build/ferry-server >"$LOG_DIR/ferry-server.log" 2>&1 &
 PIDS+=($!)
+
+wait_http "$RECEIVER_URL/healthz" "chaos-receiver"
+wait_http "$SERVER_URL/readyz" "ferry-server"
 
 FERRY_WORKER_PROBE_ADDR=":8082" \
 FERRY_WORKER_METRICS_ADDR=":2113" \
 FERRY_PG_DSN="$PG_DSN" \
 FERRY_KAFKA_BROKERS="$KAFKA_BROKERS" \
+FERRY_KAFKA_READY_TOPIC="$KAFKA_READY_TOPIC" \
+FERRY_KAFKA_GROUP_ID="$KAFKA_GROUP_ID" \
 FERRY_REDIS_ADDR="$REDIS_ADDR" \
   ./.build/ferry-worker >"$LOG_DIR/ferry-worker.log" 2>&1 &
 WORKER_PID=$!
 PIDS+=("$WORKER_PID")
 
-wait_http "$RECEIVER_URL/healthz" "chaos-receiver"
-wait_http "$SERVER_URL/readyz" "ferry-server"
 wait_http "$WORKER_URL/readyz" "ferry-worker"
 
 echo "[5/6] Running Milestone 1 end-to-end checks..."
@@ -94,7 +106,7 @@ EP_ID="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$EP
 echo "Created Endpoint: $EP_ID"
 
 RAW_PAYLOAD='{"z": 1,   "a": "ferry-m1"}'
-IDEM_KEY="m1-idem-$(date +%s)"
+IDEM_KEY="m1-idem-${RUN_ID}"
 TMP_CODES="$LOG_DIR/codes.txt"
 TMP_IDS="$LOG_DIR/ids.txt"
 : >"$TMP_CODES"
@@ -162,7 +174,7 @@ BAD_EP_ID="$(curl -fsS -X POST "$SERVER_URL/v1/endpoints" \
 
 BAD_TASK_ID="$(curl -fsS -X POST "$SERVER_URL/v1/tasks" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: m1-400-$(date +%s)" \
+  -H "Idempotency-Key: m1-400-${RUN_ID}" \
   -d "{\"endpoint_id\":\"$BAD_EP_ID\",\"payload\":{\"kind\":\"bad\"}}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 
@@ -190,7 +202,7 @@ SLOW_EP_ID="$(curl -fsS -X POST "$SERVER_URL/v1/endpoints" \
 
 SLOW_TASK_ID="$(curl -fsS -X POST "$SERVER_URL/v1/tasks" \
   -H "Content-Type: application/json" \
-  -H "Idempotency-Key: m1-slow-$(date +%s)" \
+  -H "Idempotency-Key: m1-slow-${RUN_ID}" \
   -d "{\"endpoint_id\":\"$SLOW_EP_ID\",\"payload\":{\"slow\":true}}" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
 

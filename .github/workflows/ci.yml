@@ -27,33 +27,22 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Check formatting and ADR numbering
+      - name: Check formatting, ADR numbering, and scripts
         run: |
-          set -euo pipefail
-          unformatted="$(gofmt -l .)"
-          if [ -n "$unformatted" ]; then
-            printf "Files need gofmt:\n%s\n" "$unformatted"
-            exit 1
-          fi
-          dups="$(ls docs/adr | sed -n 's/^\([0-9]\{4\}\)-.*/\1/p' | sort | uniq -d)"
-          if [ -n "$dups" ]; then
-            printf "Duplicate ADR numeric prefixes:\n%s\n" "$dups"
-            exit 1
-          fi
+          make fmt-check
+          make check-adr
+          REQUIRE_SHELLCHECK=1 make check-scripts
 
       - name: Install and run golangci-lint
         run: |
           go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
-          golangci-lint config verify
-          golangci-lint run ./...
+          make lint
 
       - name: Run unit tests
-        run: go test -race -short ./...
+        run: make test
 
       - name: Build cmd binaries
-        run: |
-          mkdir -p .build
-          go build -v -o .build/ ./cmd/...
+        run: make build
 
   integration:
     name: Integration Tests (PG + Kafka + Redis)
@@ -79,6 +68,9 @@ jobs:
 
       - name: Run integration tests
         run: make test-integration
+
+      - name: Run Milestone 1 black-box verification
+        run: timeout 120 env SKIP_TESTS=1 make verify-m1
 
       - name: Tear down services
         if: always()

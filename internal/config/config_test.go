@@ -1,6 +1,16 @@
 package config_test
 
 import (
+	"bufio"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,4 +101,180 @@ func TestLoadReceiverConfig_OverridesAndValidation(t *testing.T) {
 	if _, err := config.LoadReceiverConfig(); err == nil {
 		t.Fatal("expected error for invalid FERRY_RECEIVER_DEFAULT_STATUS")
 	}
+}
+
+func TestEnvExample_MatchesConfigAndTestEnvKeys(t *testing.T) {
+	expected := collectConfigEnvKeys(t, "config.go")
+	for _, dir := range []string{
+		filepath.Join("..", "..", "cmd"),
+		filepath.Join("..", "..", "internal"),
+		filepath.Join("..", "..", "tests"),
+	} {
+		for k := range collectTestEnvKeys(t, dir) {
+			expected[k] = struct{}{}
+		}
+	}
+
+	actual := parseEnvExampleKeys(t, filepath.Join("..", "..", ".env.example"))
+
+	var missing, extra []string
+	for k := range expected {
+		if _, ok := actual[k]; !ok {
+			missing = append(missing, k)
+		}
+	}
+	for k := range actual {
+		if _, ok := expected[k]; !ok {
+			extra = append(extra, k)
+		}
+	}
+	slices.Sort(missing)
+	slices.Sort(extra)
+
+	if len(missing) > 0 || len(extra) > 0 {
+		t.Fatalf(".env.example drifted from code: missing=%v extra=%v", missing, extra)
+	}
+}
+
+func collectConfigEnvKeys(t *testing.T, filename string) map[string]struct{} {
+	t.Helper()
+
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, filename, nil, 0)
+	if err != nil {
+		t.Fatalf("parse %s: %v", filename, err)
+	}
+
+	keys := make(map[string]struct{})
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		if !isEnvLookupCall(call.Fun) {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			return true
+		}
+		key, err := strconv.Unquote(lit.Value)
+		if err != nil {
+			t.Fatalf("%s: unquote %s: %v", filename, lit.Value, err)
+		}
+		if strings.HasPrefix(key, "FERRY_") {
+			keys[key] = struct{}{}
+		}
+		return true
+	})
+
+	if len(keys) == 0 {
+		t.Fatalf("expected non-empty FERRY_* keys parsed from %s", filename)
+	}
+	return keys
+}
+
+func isEnvLookupCall(fn ast.Expr) bool {
+	switch f := fn.(type) {
+	case *ast.Ident:
+		return strings.HasPrefix(f.Name, "env")
+	case *ast.SelectorExpr:
+		pkg, ok := f.X.(*ast.Ident)
+		return ok && pkg.Name == "os" && (f.Sel.Name == "Getenv" || f.Sel.Name == "LookupEnv")
+	default:
+		return false
+	}
+}
+
+func collectTestEnvKeys(t *testing.T, root string) map[string]struct{} {
+	t.Helper()
+
+	keys := make(map[string]struct{})
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() || !strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		file, parseErr := parser.ParseFile(fset, path, nil, 0)
+		if parseErr != nil {
+			return parseErr
+		}
+		var firstErr error
+		ast.Inspect(file, func(n ast.Node) bool {
+			if firstErr != nil {
+				return false
+			}
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) == 0 {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			pkg, ok := sel.X.(*ast.Ident)
+			if !ok || pkg.Name != "os" || (sel.Sel.Name != "Getenv" && sel.Sel.Name != "LookupEnv") {
+				return true
+			}
+			lit, ok := call.Args[0].(*ast.BasicLit)
+			if !ok || lit.Kind != token.STRING {
+				return true
+			}
+			key, unquoteErr := strconv.Unquote(lit.Value)
+			if unquoteErr != nil {
+				firstErr = unquoteErr
+				return false
+			}
+			if strings.HasPrefix(key, "FERRY_TEST_") {
+				keys[key] = struct{}{}
+			}
+			return true
+		})
+		return firstErr
+	})
+	if err != nil {
+		t.Fatalf("walk %s for FERRY_TEST_* env keys: %v", root, err)
+	}
+	return keys
+}
+
+func parseEnvExampleKeys(t *testing.T, path string) map[string]struct{} {
+	t.Helper()
+
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil {
+			t.Errorf("close %s: %v", path, closeErr)
+		}
+	}()
+
+	keys := make(map[string]struct{})
+	scanner := bufio.NewScanner(f)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, _, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) == "" {
+			t.Fatalf("%s:%d: expected KEY=VALUE entry, got %q", path, lineNo, line)
+		}
+		key = strings.TrimSpace(key)
+		if _, dup := keys[key]; dup {
+			t.Fatalf("%s:%d: duplicate env key %q", path, lineNo, key)
+		}
+		keys[key] = struct{}{}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatalf("scan %s: %v", path, err)
+	}
+	return keys
 }
