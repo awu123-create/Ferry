@@ -32,7 +32,7 @@ type Handler struct {
 	endpoints EndpointStore
 	tasks     TaskStore
 	locker    ExecutionLocker
-	delayed   DelayedRemover
+	delayed   DelayedCanceller
 	probes    []ReadinessProbe
 	cfg       HandlerConfig
 	mux       *http.ServeMux
@@ -44,7 +44,7 @@ func NewHandler(
 	endpoints EndpointStore,
 	tasks TaskStore,
 	locker ExecutionLocker,
-	delayed DelayedRemover,
+	delayed DelayedCanceller,
 	probes []ReadinessProbe,
 	cfg HandlerConfig,
 ) (*Handler, error) {
@@ -58,7 +58,7 @@ func NewHandler(
 		return nil, fmt.Errorf("api handler requires an ExecutionLocker")
 	}
 	if delayed == nil {
-		return nil, fmt.Errorf("api handler requires a DelayedRemover")
+		return nil, fmt.Errorf("api handler requires a DelayedCanceller")
 	}
 	if log == nil {
 		log = zap.NewNop()

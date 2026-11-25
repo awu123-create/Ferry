@@ -28,20 +28,21 @@
 1. **复合乐观版本 `(replay_count, attempt)`**：不新增冗余版本列，Worker 在 Step B（过期/禁用转死信）与 Step E（投递结算）更新 `tasks` 时统一附加版本守卫：
    `WHERE id = $1 AND replay_count = $loaded_replay AND attempt = $loaded_attempt AND status IN ('PENDING', 'RETRYING')`。
 2. **`task_attempts` 记录重放轮次**：`task_attempts` 表新增 `replay_count INT NOT NULL DEFAULT 0` 列，建立普通索引 `(task_id, replay_count, attempt_no)`——既精确区分各次重放轮次，又允许极端锁超时脑裂双发时落败方安全写入真实发生的 HTTP 审计行而不触发唯一键冲突。
-3. **`deadline_at` 起算基准与默认退避曲线（支持环境变量覆盖）**：
-   - `deadline_at` 默认设为**首次计划触发时间 `next_run_at + default_ttl`**（默认 `24h`，可通过环境变量覆盖；若入站显式指定则强制校验 `deadline_at > deliver_at`）；`Task.RecordOutcome` 计算的下次退避时间若已越过 `deadline_at`，当场直接转入 `DEAD_LETTER(TTL_EXPIRED)`；
+3. **`deliver_at` 预约上限、`deadline_at` 起算基准与默认退避曲线（支持环境变量覆盖）**：
+   - 创建任务入站 `deliver_at` 允许最远预约 `now + 30d`（闭区间，超出返回 `400 VALIDATION_ERROR`；`deliver_at <= now` 按立即投递处理）；
+   - `deadline_at` 默认设为 **`max(next_run_at, now) + default_ttl`**（默认 `24h`，可通过环境变量覆盖，避免传入过去时间 `deliver_at` 时创建即过期；若入站显式指定则强制校验 `deadline_at > next_run_at` 且 `deadline_at > now`）；`Task.RecordOutcome` 计算的下次退避时间若已越过 `deadline_at`，当场直接转入 `DEAD_LETTER(TTL_EXPIRED)`；
    - 完整模式下默认 `max_attempts = 6`（含首次共 6 次尝试，最多退避 5 次），采用带 ±20% 均衡抖动的指数退避：`base = 5s, multiplier = 5, cap = 4h`（等待序列约 `5s -> 25s -> ~2m -> ~10m -> ~52m`，参数均支持通过环境变量覆盖以支撑秒级自动化验收）。
 
 ### 三、`Execution Lock` 四步闭环与延迟池 / Reconciler 时序统一（修订 ADR-0003 / 0004 / 0007）
 
 1. **`Execution Lock` 四步协议**：
-   - **提交后放锁**：锁生命周期覆盖 Step B ~ Step E 全过程，必须在 PG 结算事务提交并完成流控回报后才释放；
+   - **提交/回写后先放锁再确认位移**：锁生命周期覆盖 Step B ~ Step E 全过程，拆为外层统一 `Ack` 与内层单 `defer` 放锁两层结构——在 PG 结算事务提交（及流控回报）或早到写回延迟池之后、返回给外层调用 Kafka `Ack` 之前，内层 `defer` 按 token 校验归属释放执行锁；若业务已成功持久化但收尾放锁偶发遇到 Redis 瞬时报错，仅记 `Warn` 日志交由短锁 TTL 自然过期，不阻断外层 `Ack`（避免 `offsetTracker` 队头卡死整条 Kafka 分区提交水位与内存积压）；若业务步骤自身报错，内层 `defer` 仍执行释放且不覆盖原错误，外层跳过 `Ack`；
    - **持有人验主删锁**：加锁写入唯一随机 `token`，释放时通过 Lua 比对 `GET == token` 后再 `DEL`；
-   - **抢锁争用保底顺延**：Worker `SET NX` 抢锁失败时，读取当前锁剩余过期时间（兜底 `+5s`）执行 `ZADD NX ferry:delayed <wake_at_ms> <task_id>` 埋下保底唤醒点后再确认 Kafka Offset，杜绝前任 Worker 强杀后重平衡消息被吞；
-   - **`Cancel` 主动抢锁真互斥**：`POST /v1/tasks/{id}/cancel` 自身先执行 `SET NX` 抢占该任务的 `Execution Lock`（抢不到直接返回 `409 Conflict`），持锁期间执行 PG CAS 置 `CANCELLED`、清理延迟池并在 `defer` 中验主放锁，彻底消除“先探活再改库”的竞态窗口。
-2. **延迟池分数比对删除与早到守卫**：
-   - Forwarder 在单轮循环内持有局部 `lease_until_ms`，推 Kafka 确认后执行 Lua 条件删除——**仅当 `ZSCORE == lease_until_ms` 时才 `ZREM`**，保护期间被 Worker 新写入的顺延或退避计划；
-   - Worker Step B 校验发现 `now < task.next_run_at` 时拦截退避期内抢跑，执行一次保底 `ZADD ferry:delayed <next_run_at_ms> <task_id>` 后提交 Offset。
+   - **抢锁争用快路径与取消标记拒写**：Worker `SET NX` 抢锁失败时，先查询一次 PG `tasks` 状态——若任务不存在或已进入终态直接确认 Kafka Offset（零次写 Redis）；仍为活跃态再调原子 Lua `DeferContendedTask`：先校验取消标记 `ferry:delayed:cancelled:<task_id>`（存在则拒绝写入并顺手 `ZREM + HDEL`），不存在再读取锁剩余过期时间（兜底 `5s`，可配置）写入唤醒点（若 `ferry:delayed` 仅剩 `ferry:delayed:lease` 中的 Forwarder 临时租约则覆盖并删掉租约记录，已有正式排期则保持不动），完成后确认 Offset；
+   - **`Cancel` 主动抢锁真互斥、同事务清 Outbox 与取消标记**：`POST /v1/tasks/{id}/cancel` 自身先执行 `SET NX` 抢占该任务的 `Execution Lock`（抢不到直接返回 `409 Conflict`），持锁期间在单个 PG 事务内原子将非终态 `tasks` CAS 置为 `CANCELLED` 并执行 `DELETE FROM outbox WHERE task_id = $1`（若 Outbox Relay 正持有该 `outbox` 行锁写 Redis 则在此等待其提交以保证串行化），事务提交后再由单条 Redis Lua（`CancelDelayed`）原子写入固定 `10m` TTL 的取消标记 `ferry:delayed:cancelled:<task_id>`（足够覆盖所有在途迟写窗口，同时避免远期任务在 Redis `noeviction` 策略下长期滞留死键）并执行 `ZREM ferry:delayed` + `HDEL ferry:delayed:lease`（清理失败仅记告警日志以保住取消接口可用性），最后释放锁返回 `200 OK`。
+2. **延迟池租约登记簿、单轮共享超时与早到守卫**：
+   - Forwarder 单轮 `Claim + Publish + 正常 Ack` 共享同一个硬超时 `roundDeadline <= min(5s, LeaseTTL/2)`（若推入 Kafka 确认后父 `ctx` 已进入停机取消态，则切换同样受 `min(5s, LeaseTTL/2)` 约束的独立停机收尾预算）；领取到期任务施加 `Schedule Lease` 时同步在 `ferry:delayed:lease` Hash 登记 `task_id -> lease_until_ms`，推 Kafka 确认后的 Lua 条件删除**仅当 `ferry:delayed:lease` 仍登记本轮 `lease_until_ms` 且 `ZSCORE == lease_until_ms` 时才执行 `HDEL + ZREM`**；所有 `ScheduleDelayed` / `ScheduleDelayedBatch` / `DeferContendedTask` 写池 Lua 均原子校验 `ferry:delayed:cancelled:<task_id>`（命中取消标记即拒写并清理残留），写入成功后同步 `HDEL` 清除旧租约记录，且时间戳按毫秒向上取整消除亚毫秒截断提前唤醒；
+   - Worker Step B 早到守卫区分任务类别：立即任务（`NextRunAt <= CreatedAt` 且 `Attempt == 0`、`Status == PENDING`）保留 `1s` 跨机时钟偏差容差，预约任务与退避重试任务严格按 `now < task.NextRunAt` 拦截抢跑；命中早到时严格按“覆写写回 `ferry:delayed`（在 Lua 内按 `max(ceil(next_run_at), redis_now + ceil(next_run_at - worker_now))` 避免因跨机时钟偏差刚放回又被立刻捞出空转，并清掉租约记录）-> 内层单 `defer` 释放执行锁（瞬时报错仅记 `Warn` 交由 TTL 过期，不卡分区水位）-> 外层确认 Offset”顺序执行。
 3. **Reconciler 游标排空与归口延迟池**：
    - 每 `60s` 对账周期采用 `(next_run_at, id)` 游标循环分批扫描直至排空全部超期在途任务；
    - 发现任务在 Redis 中缺失时，不再直推 Kafka、也不再篡改 PG `next_run_at + 30s`，而是执行 `ZADD NX ferry:delayed <now_ms> <task_id>` 交由 Forwarder 按标准租约协议转发，保持 `NextRunAt` 语义绝对单一（Retry 路径遵循“先提交 PG 状态、再写延迟池”，极端断连由 Reconciler 兜底）。
@@ -49,7 +50,7 @@
 ### 四、`Outbox` 双通道防堵、固定分区键与流控“叫号机排期”加固（修订 ADR-0002 / 0004 / 0007）
 
 1. **`Outbox` 双通道隔离与 `5s` 事务硬超时**：
-   - 将索引升级为 `outbox_deliver_idx (deliver_at ASC, id ASC)`，拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka）与**延迟通道**（`deliver_at > now()` 写 Redis，遇 Redis 故障暂停响应 `NOTIFY` 独立退避），凭 `FOR UPDATE SKIP LOCKED` 保证临界点绝不重搬；
+   - 将索引升级为 `outbox_deliver_idx (deliver_at ASC, id ASC)`，拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka）与**延迟通道**（`deliver_at > now() AND deliver_at > created_at`，避免跨机或并发时钟偏差误抢立即任务；通过原子批量 Lua 脚本将到期时间戳写入 `ferry:delayed` 并清除 `ferry:delayed:lease` 残留租约标记后物理删除，遇 Redis 故障暂停响应 `NOTIFY` 独立退避），凭 `FOR UPDATE SKIP LOCKED` 保证临界点绝不重搬；
    - 单批 `ClaimAndDispatch` 强制绑定 `5s` 超时 Context，超时立即中断回滚以保护 PG Autovacuum；消费方接口回调参数采用 Go 原生匿名 `func` 签名以保持零跨包耦合。
 2. **固定 Kafka 分区键为 `task_id`**：统一按 `task_id` 哈希将大商户突发流量均匀打散至全部分区消费。
 3. **流控虚拟排号（`next_free_ms`）、对称切口与 Lua 边界**：

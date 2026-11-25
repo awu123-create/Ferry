@@ -31,13 +31,13 @@ type ReadyPublisher interface {
 	PublishTaskIDs(ctx context.Context, taskIDs []uuid.UUID) error
 }
 
-// DelayedEnqueuer 定义 Outbox 延迟通道批量写入延迟池的出站接口。
+// DelayedEnqueuer 定义 Outbox 延迟通道批量写入延迟池的接口。
 type DelayedEnqueuer interface {
 	ScheduleDelayedBatch(ctx context.Context, items []domain.OutboxItem) error
 }
 
-// DelayedQueue 定义 DelayedForwarder 领取到期租约批次并条件确认删除的延迟池接口。
+// DelayedQueue 定义 DelayedForwarder 领取到期任务批次、发完后再按租约确认删除的延迟池接口。
 type DelayedQueue interface {
-	ClaimDelayed(ctx context.Context, limit int, leaseTTL time.Duration) (taskIDs []uuid.UUID, leaseUntilMs int64, err error)
-	AckDelayed(ctx context.Context, taskIDs []uuid.UUID, leaseUntilMs int64) error
+	ClaimDelayed(ctx context.Context, limit int, leaseTTL time.Duration) (domain.DelayedLeaseBatch, error)
+	AckDelayed(ctx context.Context, batch domain.DelayedLeaseBatch) error
 }

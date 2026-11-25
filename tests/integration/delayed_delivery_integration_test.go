@@ -52,6 +52,20 @@ func (h *flowHarness) delayedScore(taskID uuid.UUID) (float64, bool) {
 	return score, true
 }
 
+func (h *flowHarness) delayedLeaseExists(taskID uuid.UUID) bool {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := h.redisCli.Raw().HGet(ctx, "ferry:delayed:lease", taskID.String()).Result()
+	if errors.Is(err, goredis.Nil) {
+		return false
+	}
+	if err != nil {
+		h.t.Fatalf("HGet ferry:delayed:lease %s failed: %v", taskID, err)
+	}
+	return true
+}
+
 func (h *flowHarness) createTaskWithDeliverAt(epID uuid.UUID, idemKey string, deliverAt *time.Time) (int, taskResp) {
 	h.t.Helper()
 	body := map[string]any{
@@ -105,9 +119,9 @@ func TestDelayedDeliveryAndCancelIntegration(t *testing.T) {
 	t.Cleanup(downstream.Close)
 
 	h = newFlowHarness(t)
-	h.startRelay()
-	h.startForwarder()
-	h.startWorker()
+	h.relayRunner.start()
+	h.forwarderRunner.start()
+	h.workerRunner.start()
 
 	epDeliver := h.createEndpoint("delayed-deliver", downstream.URL+"/deliver", "", 5000)
 	epCancel := h.createEndpoint("delayed-cancel", downstream.URL+"/cancelled", "", 5000)
@@ -185,8 +199,10 @@ func TestDelayedDeliveryAndCancelIntegration(t *testing.T) {
 	}
 }
 
-// TestWorkerContentionAndEarlyArrivalIntegration 验证 Worker 抢锁争用（ZADD NX 保底）与早到拦截（覆写 ZADD 写回）
-// 均先写回延迟池再确认位移，并在锁过期或到期后经 Forwarder 恢复成功投递。
+// TestWorkerContentionAndEarlyArrivalIntegration 验证两类常见并发边界：
+//  1. 预约任务提前 ~600ms 到达 Worker 时不能提前发 HTTP，放回延迟池等到点再投递；
+//  2. 同一条预约任务先后经历“早到放回 -> 到点被 Forwarder 挂上 30s 租约 -> 并发 Worker 没抢到锁改写唤醒时间 ->
+//     Forwarder 随后调用 AckDelayed”，成员不会被误删，锁过期后正常投递成功。
 func TestWorkerContentionAndEarlyArrivalIntegration(t *testing.T) {
 	ctx := context.Background()
 
@@ -209,60 +225,311 @@ func TestWorkerContentionAndEarlyArrivalIntegration(t *testing.T) {
 	h = newFlowHarness(t)
 	ep := h.createEndpoint("worker-guard", downstream.URL+"/hook", "", 5000)
 
-	// 场景 1（早到拦截）：创建 2.2s 后执行的任务，先只启动 Worker 不启动 Relay/Forwarder，
-	// 直接将任务 ID 推入 Kafka 模拟提前到达 -> Worker 必须不发 HTTP 且覆写 ZADD 写回 NextRunAt。
-	earlyAt := h.redisNow().Add(2200 * time.Millisecond)
-	earlyCode, earlyTask := h.createTaskWithDeliverAt(ep.ID, "early-arrival-1", &earlyAt)
+	// 先跑通一条热身立即任务，确保 Kafka 消费组已完成初次 Join，避免初始重平衡耗时吃掉 500ms 早到窗口。
+	h.workerRunner.start()
+	warmCode, warmTask := h.createTaskWithDeliverAt(ep.ID, "warmup-1", nil)
+	if warmCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for warmup task, got %d", warmCode)
+	}
+	if err := h.producer.PublishTaskIDs(ctx, []uuid.UUID{warmTask.ID}); err != nil {
+		t.Fatalf("PublishTaskIDs(warmup) failed: %v", err)
+	}
+	waitUntil(t, defaultIntegrationWaitTime, "warmup task establishes kafka consumer group", func() bool {
+		return h.getTask(warmTask.ID).Status == string(domain.TaskStatusSucceeded)
+	})
+
+	// 场景 1（预约任务提前 ~600ms 到达）：严格拦截、零 HTTP 请求并覆写写回 ferry:delayed，到点后经 Forwarder 准时投递。
+	earlyAt := h.redisNow().Add(700 * time.Millisecond)
+	earlyCode, earlyTask := h.createTaskWithDeliverAt(ep.ID, "early-arrival-500ms", &earlyAt)
 	if earlyCode != http.StatusAccepted {
 		t.Fatalf("expected 202 for early task, got %d", earlyCode)
 	}
-
-	h.startWorker()
 	if err := h.producer.PublishTaskIDs(ctx, []uuid.UUID{earlyTask.ID}); err != nil {
 		t.Fatalf("PublishTaskIDs(early) failed: %v", err)
 	}
-	waitUntil(t, 5*time.Second, "early arrival task requeued to ferry:delayed", func() bool {
+	waitUntil(t, 5*time.Second, "early arrival task requeued to ferry:delayed before due time", func() bool {
 		score, ok := h.delayedScore(earlyTask.ID)
-		return ok && int64(score) == earlyAt.UnixMilli()
+		return ok && int64(score) >= earlyAt.UnixMilli()
 	})
 	mu.Lock()
 	earlyPrematureHits := hits[earlyTask.ID.String()]
 	mu.Unlock()
 	if earlyPrematureHits != 0 {
-		t.Fatalf("expected 0 hits on early arrival, got %d", earlyPrematureHits)
+		t.Fatalf("expected 0 hits when scheduled task arrived ~500ms early, got %d", earlyPrematureHits)
 	}
 
-	// 场景 2（抢锁争用）：预占立即任务的 Execution Lock（700ms TTL）模拟前任 Worker 强杀遗留锁，
-	// 推送到 Kafka -> Worker 抢锁失败通过 Lua ZADD NX 写回延迟池。
-	contendCode, contendTask := h.createTaskWithDeliverAt(ep.ID, "lock-contend-1", nil)
-	if contendCode != http.StatusAccepted {
-		t.Fatalf("expected 202 for contended task, got %d", contendCode)
-	}
-	if _, acquired, err := h.redisCli.AcquireExecutionLock(ctx, contendTask.ID, 700*time.Millisecond); err != nil || !acquired {
-		t.Fatalf("pre-acquire execution lock failed: acquired=%v err=%v", acquired, err)
-	}
-	if err := h.producer.PublishTaskIDs(ctx, []uuid.UUID{contendTask.ID}); err != nil {
-		t.Fatalf("PublishTaskIDs(contended) failed: %v", err)
-	}
-	waitUntil(t, 5*time.Second, "contended task deferred into ferry:delayed", func() bool {
-		_, ok := h.delayedScore(contendTask.ID)
-		return ok
-	})
-
-	// 启动 DelayedForwarder：两条写回延迟池的任务在锁过期 / 到期后均应恢复成功投递。
-	h.startForwarder()
-	waitUntil(t, defaultIntegrationWaitTime, "contended task recovers and succeeds", func() bool {
-		return h.getTask(contendTask.ID).Status == string(domain.TaskStatusSucceeded)
-	})
+	h.forwarderRunner.start()
 	waitUntil(t, defaultIntegrationWaitTime, "early arrival task delivers on time and succeeds", func() bool {
 		return h.getTask(earlyTask.ID).Status == string(domain.TaskStatusSucceeded)
 	})
+	h.forwarderRunner.stop()
 
 	mu.Lock()
 	earlyDeliveredAt := receivedAt[earlyTask.ID.String()]
 	mu.Unlock()
 	if earlyDeliveredAt.Before(earlyAt.Add(-50 * time.Millisecond)) {
 		t.Fatalf("early task delivered before NextRunAt: got=%v want>=%v", earlyDeliveredAt, earlyAt)
+	}
+
+	// 场景 2（同一条预约任务依次经过：早到放回 -> Forwarder 挂 30s 租约 -> 并发 Worker 撞锁改写 -> Forwarder 延迟删租约）：
+	// 1) 预约任务先被 Worker 拦下放回 ferry:delayed，并释放 Execution Lock；
+	// 2) 到点后模拟 Forwarder 领走并挂上 30s Schedule Lease，还没来得及删租约；
+	// 3) 另一个持锁方先占着 Execution Lock（500ms），并发 Worker 消费 Kafka 消息没抢到锁，改写唤醒时间并清掉租约记录；
+	// 4) Forwarder 随后执行 AckDelayed，不能把刚改写的唤醒时间误删；锁过期后正常投递至 SUCCEEDED。
+	racedAt := h.redisNow().Add(450 * time.Millisecond)
+	racedCode, racedTask := h.createTaskWithDeliverAt(ep.ID, "early-lease-contend-1", &racedAt)
+	if racedCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for raced task, got %d", racedCode)
+	}
+	var earlyAcked bool
+	if err := h.worker.ProcessDelivery(ctx, domain.ReadyDelivery{
+		TaskID: racedTask.ID,
+		Ack:    func() { earlyAcked = true },
+	}); err != nil {
+		t.Fatalf("ProcessDelivery(early on racedTask) failed: %v", err)
+	}
+	if !earlyAcked {
+		t.Fatal("expected early-arrival worker to ack racedTask after requeuing")
+	}
+	mu.Lock()
+	racedPrematureHits := hits[racedTask.ID.String()]
+	mu.Unlock()
+	if racedPrematureHits != 0 {
+		t.Fatalf("expected 0 premature hits on racedTask early arrival, got %d", racedPrematureHits)
+	}
+
+	// 等到 racedAt 到点，模拟 Forwarder 领走该任务并挂上 30s Schedule Lease。
+	var leasedBatch domain.DelayedLeaseBatch
+	waitUntil(t, 5*time.Second, "forwarder claims racedTask once due", func() bool {
+		batch, claimErr := h.redisCli.ClaimDelayed(ctx, 10, 30*time.Second)
+		if claimErr != nil {
+			t.Fatalf("ClaimDelayed(racedTask) failed: %v", claimErr)
+		}
+		if len(batch.TaskIDs) == 1 && batch.TaskIDs[0] == racedTask.ID {
+			leasedBatch = batch
+			return true
+		}
+		return false
+	})
+	if !h.delayedLeaseExists(racedTask.ID) {
+		t.Fatal("expected temporary lease marker in ferry:delayed:lease after ClaimDelayed")
+	}
+
+	// 模拟别的持锁方占着 Execution Lock（500ms），并发 Worker 消费到这条消息没抢到锁，改写延迟池并清掉租约记录。
+	if _, acquired, err := h.redisCli.AcquireExecutionLock(ctx, racedTask.ID, 500*time.Millisecond); err != nil || !acquired {
+		t.Fatalf("pre-acquire execution lock failed: acquired=%v err=%v", acquired, err)
+	}
+	if err := h.producer.PublishTaskIDs(ctx, []uuid.UUID{racedTask.ID}); err != nil {
+		t.Fatalf("PublishTaskIDs(racedTask contended) failed: %v", err)
+	}
+	waitUntil(t, 5*time.Second, "contended worker replaces temporary lease marker on racedTask", func() bool {
+		return !h.delayedLeaseExists(racedTask.ID)
+	})
+
+	// 此时 Forwarder 才来执行 AckDelayed：因为租约记录已经被清掉，延迟池里的新唤醒时间必须完好保留。
+	if err := h.redisCli.AckDelayed(ctx, leasedBatch); err != nil {
+		t.Fatalf("AckDelayed after worker contention failed: %v", err)
+	}
+	if _, ok := h.delayedScore(racedTask.ID); !ok {
+		t.Fatalf("racedTask %s was wrongly deleted by Forwarder AckDelayed", racedTask.ID)
+	}
+
+	// 启动 DelayedForwarder：等锁过期后，racedTask 恢复并投递成功。
+	h.forwarderRunner.start()
+	waitUntil(t, defaultIntegrationWaitTime, "raced task recovers and succeeds", func() bool {
+		return h.getTask(racedTask.ID).Status == string(domain.TaskStatusSucceeded)
+	})
+
+	mu.Lock()
+	racedDeliveredAt := receivedAt[racedTask.ID.String()]
+	mu.Unlock()
+	if racedDeliveredAt.Before(racedAt.Add(-50 * time.Millisecond)) {
+		t.Fatalf("raced task delivered before NextRunAt: got=%v want>=%v", racedDeliveredAt, racedAt)
+	}
+}
+
+// TestCancelConcurrentWithDelayedProducersZeroResidueIntegration 验证取消任务和两类延迟写入并发撞车时，
+// Redis 延迟池、租约表零残留且不会触发无效 Kafka 转发：
+//  1. 取消请求撞上正锁着 outbox 行往 Redis 写的 Relay -> 等 Relay 提交完后再由 CancelDelayed 清理并立取消标记；
+//  2. Worker B 查完 PG（还看到 PENDING）后在写延迟池前停顿 -> Worker A 放锁 + Cancel 接口返回 200 OK ->
+//     放行 Worker B 执行迟写 -> 真实 DelayedForwarder 轮询越过唤醒时长 -> 延迟池零残留且 Kafka 收到 0 条转发消息。
+func TestCancelConcurrentWithDelayedProducersZeroResidueIntegration(t *testing.T) {
+	ctx := context.Background()
+	var downstreamHits atomic.Int32
+
+	downstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		downstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(downstream.Close)
+
+	h := newFlowHarness(t)
+	ep := h.createEndpoint("cancel-race-ep", downstream.URL+"/never", "", 5000)
+
+	// 子场景 1：Cancel vs 已持 FOR UPDATE 行锁正在写 Redis 的延迟 Outbox Relay。
+	futureAt := h.redisNow().Add(2 * time.Minute)
+	code1, relayRacedTask := h.createTaskWithDeliverAt(ep.ID, "cancel-vs-relay-1", &futureAt)
+	if code1 != http.StatusAccepted {
+		t.Fatalf("expected 202 for relayRacedTask, got %d", code1)
+	}
+
+	relayHolding := make(chan struct{})
+	releaseRelay := make(chan struct{})
+	relayErrCh := make(chan error, 1)
+	go func() {
+		_, err := h.pgStore.ClaimAndDispatchDelayedOutbox(ctx, h.redisNow(), 10, func(cbCtx context.Context, items []domain.OutboxItem) error {
+			close(relayHolding)
+			<-releaseRelay
+			return h.redisCli.ScheduleDelayedBatch(cbCtx, items)
+		})
+		relayErrCh <- err
+	}()
+
+	select {
+	case <-relayHolding:
+	case <-time.After(3 * time.Second):
+		close(releaseRelay)
+		t.Fatal("timed out waiting for delayed outbox claim to lock row")
+	}
+
+	cancelStatusCh := make(chan int, 1)
+	go func() {
+		status, _ := h.doJSON(http.MethodPost, "/v1/tasks/"+relayRacedTask.ID.String()+"/cancel", nil, nil)
+		cancelStatusCh <- status
+	}()
+
+	// Relay 尚未提交前，Cancel 事务的 DELETE FROM outbox 必须等待行锁释放，不能抢跑返回 200。
+	select {
+	case status := <-cancelStatusCh:
+		close(releaseRelay)
+		t.Fatalf("cancel API returned %d before delayed relay committed outbox row lock", status)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(releaseRelay)
+	if err := <-relayErrCh; err != nil {
+		t.Fatalf("delayed outbox claim failed: %v", err)
+	}
+	select {
+	case status := <-cancelStatusCh:
+		if status != http.StatusOK {
+			t.Fatalf("expected cancel API 200 OK after relay commit, got %d", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cancel API to finish after relay commit")
+	}
+
+	if _, exists := h.delayedScore(relayRacedTask.ID); exists {
+		t.Fatalf("expected zero ferry:delayed residue after cancel vs relay race for task %s", relayRacedTask.ID)
+	}
+	if h.delayedLeaseExists(relayRacedTask.ID) {
+		t.Fatalf("expected zero ferry:delayed:lease residue for task %s", relayRacedTask.ID)
+	}
+
+	// 子场景 2（真实 Redis + 真实 Forwarder + 真实 Kafka 夹缝交错）：
+	// 1) Worker A 持锁期间，Worker B 抢锁失败并先查 PG 看到 PENDING，随后停顿在 DeferContendedTask 之前；
+	// 2) Worker A 放锁，Cancel 接口返回 200 OK 并立下取消标记；
+	// 3) 放行滞后的 Worker B 执行 DeferContendedTask，被取消标记原子拒写；
+	// 4) 启动真实 DelayedForwarder 跑过唤醒时间窗口，断言延迟池零残留且真实 Kafka 收到 0 条转发消息。
+	code2, gapTask := h.createTaskWithDeliverAt(ep.ID, "cancel-vs-lagged-worker-gap", &futureAt)
+	if code2 != http.StatusAccepted {
+		t.Fatalf("expected 202 for gapTask, got %d", code2)
+	}
+	workerAToken, acquired, err := h.redisCli.AcquireExecutionLock(ctx, gapTask.ID, 5*time.Second)
+	if err != nil || !acquired {
+		t.Fatalf("Worker A AcquireExecutionLock failed: acquired=%v err=%v", acquired, err)
+	}
+
+	// Worker B 抢锁失败后先查 PG，此时确实读到 PENDING，并在调用 DeferContendedTask 前挂起。
+	if _, acquiredB, err := h.redisCli.AcquireExecutionLock(ctx, gapTask.ID, 5*time.Second); err != nil || acquiredB {
+		t.Fatalf("expected Worker B lock contention, acquired=%v err=%v", acquiredB, err)
+	}
+	seenByWorkerB, err := h.pgStore.GetTask(ctx, gapTask.ID)
+	if err != nil || seenByWorkerB.Status != domain.TaskStatusPending {
+		t.Fatalf("expected Worker B to observe PENDING before cancel, got %+v err=%v", seenByWorkerB, err)
+	}
+
+	// Worker A 放锁，上游调用真实 Cancel 接口返回 200 OK（PG 落 CANCELLED + Redis 立取消标记清池）。
+	if err := h.redisCli.ReleaseExecutionLock(ctx, gapTask.ID, workerAToken); err != nil {
+		t.Fatalf("Worker A ReleaseExecutionLock failed: %v", err)
+	}
+	cancelCode, cancelBody := h.doJSON(http.MethodPost, "/v1/tasks/"+gapTask.ID.String()+"/cancel", nil, nil)
+	if cancelCode != http.StatusOK {
+		t.Fatalf("expected cancel 200 OK, got %d: %s", cancelCode, cancelBody)
+	}
+
+	// 放行滞后的 Worker B 发起迟写（同时验证滞后 ScheduleDelayed 同样被拒写）。
+	const fallbackDelay = 120 * time.Millisecond
+	if err := h.redisCli.DeferContendedTask(ctx, gapTask.ID, fallbackDelay); err != nil {
+		t.Fatalf("lagged DeferContendedTask failed: %v", err)
+	}
+	if err := h.redisCli.ScheduleDelayed(ctx, gapTask.ID, h.redisNow().Add(fallbackDelay), fallbackDelay); err != nil {
+		t.Fatalf("lagged ScheduleDelayed failed: %v", err)
+	}
+	if _, exists := h.delayedScore(gapTask.ID); exists {
+		t.Fatalf("expected cancel tombstone to reject lagged writes into ferry:delayed for task %s", gapTask.ID)
+	}
+
+	// 同池放一条比 fallbackDelay 更晚到期的对照任务，启动真实 DelayedForwarder 后一直消费到对照任务到达 Kafka；
+	// 这样可以确凿证明 Forwarder 已扫过 fallbackDelay 且冷启动 Kafka 消费组已完成 Join，绝不是超时空等导致的假通过。
+	controlCode, controlTask := h.createTaskWithDeliverAt(ep.ID, "cancel-gap-control-task", &futureAt)
+	if controlCode != http.StatusAccepted {
+		t.Fatalf("expected 202 for controlTask, got %d", controlCode)
+	}
+	controlDue := h.redisNow().Add(fallbackDelay + 150*time.Millisecond)
+	if err := h.redisCli.ScheduleDelayed(ctx, controlTask.ID, controlDue, 0); err != nil {
+		t.Fatalf("ScheduleDelayed(controlTask) failed: %v", err)
+	}
+
+	h.forwarderRunner.start()
+	pollCtx, cancelPoll := context.WithTimeout(ctx, defaultIntegrationWaitTime)
+	defer cancelPoll()
+	sawControl := false
+	for !sawControl {
+		deliveries, pollErr := h.reader.PollReady(pollCtx, 10)
+		if pollErr != nil {
+			t.Fatalf("PollReady failed waiting for control task %s: %v", controlTask.ID, pollErr)
+		}
+		for _, d := range deliveries {
+			if d.Ack != nil {
+				d.Ack()
+			}
+			if d.TaskID == gapTask.ID {
+				t.Fatalf("received spurious Kafka delivery for cancelled task %s", gapTask.ID)
+			}
+			if d.TaskID == controlTask.ID {
+				sawControl = true
+			}
+		}
+	}
+
+	// 同步验证 Worker 撞锁快路径：已取消任务即便遇到锁争用也直接 Ack、不写延迟池、不发 HTTP。
+	holdToken, holdAcq, err := h.redisCli.AcquireExecutionLock(ctx, gapTask.ID, 3*time.Second)
+	if err != nil || !holdAcq {
+		t.Fatalf("re-acquire lock for fast-path check failed: acquired=%v err=%v", holdAcq, err)
+	}
+	t.Cleanup(func() {
+		_ = h.redisCli.ReleaseExecutionLock(context.Background(), gapTask.ID, holdToken)
+	})
+
+	var acked bool
+	if err := h.worker.ProcessDelivery(ctx, domain.ReadyDelivery{
+		TaskID: gapTask.ID,
+		Ack:    func() { acked = true },
+	}); err != nil {
+		t.Fatalf("ProcessDelivery fast path on cancelled contended task failed: %v", err)
+	}
+	if !acked {
+		t.Fatal("expected contended worker to ack cancelled task via PG fast path")
+	}
+	if _, exists := h.delayedScore(gapTask.ID); exists {
+		t.Fatalf("expected zero ferry:delayed residue for task %s", gapTask.ID)
+	}
+	if h.delayedLeaseExists(gapTask.ID) {
+		t.Fatalf("expected zero ferry:delayed:lease residue for task %s", gapTask.ID)
+	}
+	if downstreamHits.Load() != 0 {
+		t.Fatalf("expected zero downstream HTTP hits for cancelled tasks, got %d", downstreamHits.Load())
 	}
 }
 
@@ -358,7 +625,7 @@ func TestOutboxDualChannelRedisFailureIsolationIntegration(t *testing.T) {
 		relayRunner.start()
 		t.Cleanup(relayRunner.stop)
 
-		h.startWorker()
+		h.workerRunner.start()
 		ep := h.createEndpoint("outbox-isolation", downstream.URL+"/ok", "", 5000)
 
 		farFuture := time.Now().UTC().Add(10 * time.Minute)

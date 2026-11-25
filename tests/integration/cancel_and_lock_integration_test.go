@@ -61,9 +61,9 @@ func TestCancelAndLockIntegration(t *testing.T) {
 		t.Fatalf("expected CANCELLED, got %+v", got)
 	}
 
-	// 启动 Relay 与 Worker；该已取消任务的 outbox 会经 Kafka 到达 Worker，Worker 必须跳过并不发 HTTP。
-	h.startRelay()
-	h.startWorker()
+	// 启动 Relay 与 Worker；该已取消任务在 PG 取消事务内已同步清掉 outbox，即便有在途消息到达 Worker 也会跳过且不发 HTTP。
+	h.relayRunner.start()
+	h.workerRunner.start()
 
 	// 场景 2：提交一条会阻塞在 /hold 的任务，等 Worker 持锁进入出站请求时调用 Cancel，验证返回 409。
 	epHold := h.createEndpoint("cancel-in-flight", downstream.URL+"/hold", "", 10000)

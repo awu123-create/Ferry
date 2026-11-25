@@ -28,7 +28,7 @@ var (
 	_ api.EndpointStore         = (*pg.Store)(nil)
 	_ api.TaskStore             = (*pg.Store)(nil)
 	_ api.ExecutionLocker       = (*redis.Client)(nil)
-	_ api.DelayedRemover        = (*redis.Client)(nil)
+	_ api.DelayedCanceller      = (*redis.Client)(nil)
 	_ api.ReadinessProbe        = (*pg.Store)(nil)
 	_ api.ReadinessProbe        = (*kafka.ReadyProducer)(nil)
 	_ api.ReadinessProbe        = (*redis.Client)(nil)

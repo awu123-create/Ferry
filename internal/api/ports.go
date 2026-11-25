@@ -31,9 +31,9 @@ type ExecutionLocker interface {
 	ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error
 }
 
-// DelayedRemover 在任务取消落盘后清理延迟池中的排队成员。
-type DelayedRemover interface {
-	RemoveDelayed(ctx context.Context, taskID uuid.UUID) error
+// DelayedCanceller 在任务取消落盘后清理延迟池记录，并写入带过期时间的取消标记阻止迟到的写回。
+type DelayedCanceller interface {
+	CancelDelayed(ctx context.Context, taskID uuid.UUID, tombstoneTTL time.Duration) error
 }
 
 // ReadinessProbe 用于 /readyz 检查下游基础设施组件的就绪状态。

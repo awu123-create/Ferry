@@ -82,6 +82,7 @@ func (r *bgRunner) triggerStop() chan error {
 }
 
 func (r *bgRunner) stop() {
+	r.t.Helper()
 	done := r.triggerStop()
 	if done == nil {
 		return
@@ -97,16 +98,14 @@ func (r *bgRunner) stop() {
 }
 
 type flowHarness struct {
-	t         *testing.T
-	pgStore   *pg.Store
-	redisCli  *redis.Client
-	producer  *kafka.ReadyProducer
-	reader    *kafka.ReadyReader
-	handler   *api.Handler
-	apiSrv    *httptest.Server
-	relay     *scheduler.OutboxRelay
-	forwarder *scheduler.DelayedForwarder
-	worker    *worker.Worker
+	t        *testing.T
+	pgStore  *pg.Store
+	redisCli *redis.Client
+	producer *kafka.ReadyProducer
+	reader   *kafka.ReadyReader
+	handler  *api.Handler
+	apiSrv   *httptest.Server
+	worker   *worker.Worker
 
 	relayRunner     *bgRunner
 	forwarderRunner *bgRunner
@@ -223,8 +222,6 @@ func newFlowHarness(t *testing.T) *flowHarness {
 		reader:          reader,
 		handler:         handler,
 		apiSrv:          apiSrv,
-		relay:           relay,
-		forwarder:       forwarder,
 		worker:          w,
 		relayRunner:     &bgRunner{t: t, name: "OutboxRelay", run: relay.Run, stopTimeout: 5 * time.Second},
 		forwarderRunner: &bgRunner{t: t, name: "DelayedForwarder", run: forwarder.Run, stopTimeout: 5 * time.Second},
@@ -232,39 +229,11 @@ func newFlowHarness(t *testing.T) *flowHarness {
 	}
 
 	t.Cleanup(func() {
-		h.stopWorker()
-		h.stopForwarder()
-		h.stopRelay()
+		h.workerRunner.stop()
+		h.forwarderRunner.stop()
+		h.relayRunner.stop()
 	})
 	return h
-}
-
-func (h *flowHarness) startForwarder() {
-	h.forwarderRunner.start()
-}
-
-func (h *flowHarness) stopForwarder() {
-	h.forwarderRunner.stop()
-}
-
-func (h *flowHarness) startRelay() {
-	h.relayRunner.start()
-}
-
-func (h *flowHarness) stopRelay() {
-	h.relayRunner.stop()
-}
-
-func (h *flowHarness) startWorker() {
-	h.workerRunner.start()
-}
-
-func (h *flowHarness) triggerWorkerShutdown() chan error {
-	return h.workerRunner.triggerStop()
-}
-
-func (h *flowHarness) stopWorker() {
-	h.workerRunner.stop()
 }
 
 func (h *flowHarness) doJSON(method, path string, body []byte, headers map[string]string) (int, []byte) {

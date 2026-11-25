@@ -174,7 +174,7 @@ func TestOutboxRelay_DualChannelDrainsWakesFromSingleListenAndExitsCleanly(t *te
 	}
 
 	pub := &fakeReadyPublisher{
-		onPublish: func(_ []uuid.UUID, total int) error {
+		onPublish: func(_ context.Context, _ []uuid.UUID, total int) error {
 			if total == 2 {
 				store.mu.Lock()
 				store.immBatches = append(store.immBatches, []uuid.UUID{imm3})
@@ -287,7 +287,7 @@ func TestOutboxRelay_DelayedFailureBacksOffIgnoringNotifyWithoutBlockingImmediat
 
 	immCountCh := make(chan int, 8)
 	pub := &fakeReadyPublisher{
-		onPublish: func(_ []uuid.UUID, total int) error {
+		onPublish: func(_ context.Context, _ []uuid.UUID, total int) error {
 			immCountCh <- total
 			return nil
 		},

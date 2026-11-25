@@ -3,7 +3,6 @@ package scheduler
 import (
 	"context"
 	"fmt"
-	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -11,13 +10,12 @@ import (
 )
 
 const (
-	defaultOutboxBatchSize       = 100
-	defaultOutboxPollInterval    = 500 * time.Millisecond
-	defaultOutboxBatchTimeout    = 5 * time.Second
-	defaultSchedulerErrorBackoff = 5 * time.Second
+	defaultOutboxBatchSize    = 100
+	defaultOutboxPollInterval = 500 * time.Millisecond
+	defaultOutboxBatchTimeout = 5 * time.Second
 )
 
-// OutboxRelayConfig 配置双通道 OutboxRelay 的批量大小、兜底轮询周期、单批硬超时、退避封顶与时钟来源。
+// OutboxRelayConfig 配置双通道 OutboxRelay 的批量大小、定时轮询间隔、单批超时上限、失败退避上限和时钟来源。
 type OutboxRelayConfig struct {
 	BatchSize       int
 	PollInterval    time.Duration
@@ -26,7 +24,7 @@ type OutboxRelayConfig struct {
 	Clock           func() time.Time
 }
 
-// OutboxRelay 共享单连接 LISTEN/NOTIFY 唤醒信号，分别驱动互不阻塞的立即通道与延迟通道搬运 outbox 记录。
+// OutboxRelay 共用一条 PG LISTEN/NOTIFY 连接接收唤醒信号，再分两条互不阻塞的协程搬运立即任务和延迟任务。
 type OutboxRelay struct {
 	log       *zap.Logger
 	outbox    OutboxStore
@@ -93,18 +91,34 @@ func (r *OutboxRelay) Run(ctx context.Context) error {
 	}()
 	go func() {
 		defer wg.Done()
-		runPollLoop(ctx, r.log, "immediate outbox relay", immediateWake, r.cfg.PollInterval, r.cfg.ErrorBackoffCap, r.cfg.BatchSize, func(stepCtx context.Context) (int, error) {
-			batchCtx, cancel := context.WithTimeout(stepCtx, r.cfg.BatchTimeout)
-			defer cancel()
-			return r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.now(), r.cfg.BatchSize, r.publisher.PublishTaskIDs)
+		runPollLoop(ctx, pollLoopConfig{
+			log:          r.log,
+			component:    "immediate_outbox_relay",
+			wakeCh:       immediateWake,
+			pollInterval: r.cfg.PollInterval,
+			backoffCap:   r.cfg.ErrorBackoffCap,
+			batchSize:    r.cfg.BatchSize,
+			step: func(stepCtx context.Context) (int, error) {
+				batchCtx, cancel := context.WithTimeout(stepCtx, r.cfg.BatchTimeout)
+				defer cancel()
+				return r.outbox.ClaimAndDispatchImmediateOutbox(batchCtx, r.now(), r.cfg.BatchSize, r.publisher.PublishTaskIDs)
+			},
 		})
 	}()
 	go func() {
 		defer wg.Done()
-		runPollLoop(ctx, r.log, "delayed outbox relay", delayedWake, r.cfg.PollInterval, r.cfg.ErrorBackoffCap, r.cfg.BatchSize, func(stepCtx context.Context) (int, error) {
-			batchCtx, cancel := context.WithTimeout(stepCtx, r.cfg.BatchTimeout)
-			defer cancel()
-			return r.outbox.ClaimAndDispatchDelayedOutbox(batchCtx, r.now(), r.cfg.BatchSize, r.delayed.ScheduleDelayedBatch)
+		runPollLoop(ctx, pollLoopConfig{
+			log:          r.log,
+			component:    "delayed_outbox_relay",
+			wakeCh:       delayedWake,
+			pollInterval: r.cfg.PollInterval,
+			backoffCap:   r.cfg.ErrorBackoffCap,
+			batchSize:    r.cfg.BatchSize,
+			step: func(stepCtx context.Context) (int, error) {
+				batchCtx, cancel := context.WithTimeout(stepCtx, r.cfg.BatchTimeout)
+				defer cancel()
+				return r.outbox.ClaimAndDispatchDelayedOutbox(batchCtx, r.now(), r.cfg.BatchSize, r.delayed.ScheduleDelayedBatch)
+			},
 		})
 	}()
 
@@ -123,7 +137,7 @@ func (r *OutboxRelay) runListener(ctx context.Context, immediateWake, delayedWak
 				return
 			}
 			r.log.Warn("outbox notification wait failed; falling back to poll interval", zap.Error(err))
-			if !sleepOrCancel(ctx, r.cfg.PollInterval) {
+			if !waitWakeOrInterval(ctx, nil, r.cfg.PollInterval) {
 				return
 			}
 			continue
@@ -138,113 +152,9 @@ func (r *OutboxRelay) now() time.Time {
 	return r.cfg.Clock().UTC()
 }
 
-// runPollLoop 统一驱动周期轮询、可选唤醒信号、满批连抽与带抖动的封顶指数退避。
-// wakeCh 为 nil 时退化为纯定时轮询；退避窗口内不读取 wakeCh，防止外部通知反复惊醒故障通道；
-// 仅在真实成功处理批次（processed > 0）后重置退避，避免空轮询过早清零下游写故障退避。
-func runPollLoop(
-	ctx context.Context,
-	log *zap.Logger,
-	name string,
-	wakeCh <-chan struct{},
-	pollInterval, backoffCap time.Duration,
-	batchSize int,
-	step func(ctx context.Context) (processed int, err error),
-) {
-	var backoff time.Duration
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		drainWake(wakeCh)
-		processed, err := step(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
-			backoff = nextErrorBackoff(backoff, pollInterval, backoffCap)
-			wait := applyBackoffJitter(backoff, backoffCap)
-			log.Warn(
-				name+" batch failed; backing off",
-				zap.Duration("backoff", wait),
-				zap.Error(err),
-			)
-			if !sleepOrCancel(ctx, wait) {
-				return
-			}
-			continue
-		}
-
-		if processed > 0 {
-			backoff = 0
-		}
-		if processed >= batchSize {
-			continue
-		}
-		if !waitWakeOrInterval(ctx, wakeCh, pollInterval) {
-			return
-		}
-	}
-}
-
 func signalWake(ch chan<- struct{}) {
 	select {
 	case ch <- struct{}{}:
 	default:
 	}
-}
-
-func drainWake(ch <-chan struct{}) {
-	if ch == nil {
-		return
-	}
-	select {
-	case <-ch:
-	default:
-	}
-}
-
-func waitWakeOrInterval(ctx context.Context, wakeCh <-chan struct{}, d time.Duration) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-
-	select {
-	case <-ctx.Done():
-		return false
-	case <-wakeCh:
-		return true
-	case <-timer.C:
-		return true
-	}
-}
-
-func sleepOrCancel(ctx context.Context, d time.Duration) bool {
-	return waitWakeOrInterval(ctx, nil, d)
-}
-
-func nextErrorBackoff(current, base, maxCap time.Duration) time.Duration {
-	if current <= 0 {
-		return min(base, maxCap)
-	}
-	if current >= maxCap || current > maxCap/2 {
-		return maxCap
-	}
-	return current * 2
-}
-
-// applyBackoffJitter 为指数退避叠加小幅随机抖动（未封顶时向上 0%~20% 且不超过 maxCap，
-// 封顶时向下 0%~10%），打散多实例故障重试风暴且严格遵守 maxCap 上限。
-func applyBackoffJitter(d, maxCap time.Duration) time.Duration {
-	if d >= maxCap {
-		spread := maxCap / 10
-		if spread <= 0 {
-			return maxCap
-		}
-		return maxCap - time.Duration(rand.Int64N(int64(spread)+1))
-	}
-	spread := d / 5
-	if spread <= 0 {
-		return d
-	}
-	return min(d+time.Duration(rand.Int64N(int64(spread)+1)), maxCap)
 }

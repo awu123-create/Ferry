@@ -46,9 +46,9 @@ func (s *Store) ClaimAndDispatchImmediateOutbox(
 	})
 }
 
-// ClaimAndDispatchDelayedOutbox 在有界事务内通过 FOR UPDATE SKIP LOCKED 抢占最多 limit 条
-// 未来投递（deliver_at > now）的 outbox 记录，调用 dispatch 写入延迟池并在成功后物理删除
-// （详见 docs/adr/0002-transactional-outbox-batch-relay.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
+// ClaimAndDispatchDelayedOutbox 在带超时的事务里，用 FOR UPDATE SKIP LOCKED 取出最多 limit 条
+// 还没到点的 outbox 记录（deliver_at > now），交给 dispatch 写入延迟池，成功后再删除这些记录
+// （见 docs/adr/0002-transactional-outbox-batch-relay.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (s *Store) ClaimAndDispatchDelayedOutbox(
 	ctx context.Context,
 	now time.Time,
@@ -59,8 +59,8 @@ func (s *Store) ClaimAndDispatchDelayedOutbox(
 		return 0, fmt.Errorf("outbox dispatch callback must not be nil")
 	}
 
-	// 附加 deliver_at > created_at 守卫：立即任务（deliver_at <= created_at）即使因并发取时钟顺序或跨机偏差
-	// 略晚于 cutoff，也绝不会被延迟通道误抢进 Redis 延迟池。
+	// 额外加上 deliver_at > created_at：立即任务创建时 deliver_at 一定 <= created_at，
+	// 就算并发或不同机器时钟稍有先后，也不会被延迟通道误领进 Redis 延迟池。
 	filter := clause.And(
 		clause.Gt{Column: clause.Column{Name: "deliver_at"}, Value: now.UTC()},
 		clause.Gt{Column: clause.Column{Name: "deliver_at"}, Value: clause.Column{Name: "created_at"}},

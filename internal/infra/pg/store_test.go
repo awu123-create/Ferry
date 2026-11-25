@@ -598,3 +598,110 @@ func TestStore_OutboxDualChannelIsolationAndDueTakeover(t *testing.T) {
 		t.Fatalf("expected empty outbox, got remImm=%d err=%v", remImm, err)
 	}
 }
+
+func TestStore_CancelTaskDeletesOutboxAndSerializesWithDelayedRelay(t *testing.T) {
+	store := openIsolatedStore(t)
+	ctx := context.Background()
+	ep := mustCreateTestEndpoint(t, store, "cancel-outbox")
+
+	baseNow := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	futureAt := baseNow.Add(5 * time.Minute)
+	newFutureTask := func(key string) domain.Task {
+		t.Helper()
+		task, err := domain.NewTask(domain.NewTaskParams{
+			Endpoint:       ep,
+			IdempotencyKey: key,
+			RawPayload:     []byte(`{"k":1}`),
+			DeliverAt:      &futureAt,
+			MaxAttempts:    1,
+			DefaultWindow:  time.Hour,
+			Now:            baseNow,
+		})
+		if err != nil {
+			t.Fatalf("NewTask(%s) failed: %v", key, err)
+		}
+		res, err := store.CreateTaskIdempotent(ctx, task)
+		if err != nil {
+			t.Fatalf("CreateTaskIdempotent(%s) failed: %v", key, err)
+		}
+		return res.Task
+	}
+
+	// 场景 1：Relay 尚未锁行时，CancelTask 在同一 PG 事务内直接物理删除对应 outbox 行，Relay 永远不会再搬运。
+	taskDirect := newFutureTask("cancel-direct-1")
+	cancelledDirect, err := store.CancelTask(ctx, taskDirect.ID, baseNow.Add(time.Second))
+	if err != nil || cancelledDirect.Status != domain.TaskStatusCancelled {
+		t.Fatalf("CancelTask(direct) expected CANCELLED, got task=%+v err=%v", cancelledDirect, err)
+	}
+	claimedAfterDirect, err := store.ClaimAndDispatchDelayedOutbox(ctx, baseNow, 10, func(_ context.Context, _ []domain.OutboxItem) error {
+		t.Fatal("delayed relay must not see outbox row deleted by CancelTask")
+		return nil
+	})
+	if err != nil || claimedAfterDirect != 0 {
+		t.Fatalf("expected 0 delayed outbox items after direct cancel, got %d err=%v", claimedAfterDirect, err)
+	}
+
+	// 场景 2：Relay 已持 FOR UPDATE 行锁进入回调（模拟正在写 Redis）时，CancelTask 同事务删 outbox 必须等待行锁释放，
+	// 确保外层 API 随后的 CancelDelayed 严格晚于 Relay 写 Redis 完成；同时不得阻塞无关任务的取消。
+	taskRaced := newFutureTask("cancel-raced-1")
+	taskUnrelated := newFutureTask("cancel-unrelated-1")
+
+	relayEntered := make(chan struct{})
+	releaseRelay := make(chan struct{})
+	relayDone := make(chan error, 1)
+	go func() {
+		_, claimErr := store.ClaimAndDispatchDelayedOutbox(ctx, baseNow, 1, func(_ context.Context, items []domain.OutboxItem) error {
+			if len(items) != 1 || items[0].TaskID != taskRaced.ID {
+				return fmt.Errorf("expected raced task %s, got %+v", taskRaced.ID, items)
+			}
+			close(relayEntered)
+			<-releaseRelay
+			return nil
+		})
+		relayDone <- claimErr
+	}()
+
+	select {
+	case <-relayEntered:
+	case <-time.After(3 * time.Second):
+		close(releaseRelay)
+		t.Fatal("timed out waiting for delayed relay to lock outbox row")
+	}
+
+	// 无关任务的取消不受另一行 outbox 行锁影响，立即完成。
+	if unrelatedCancelled, err := store.CancelTask(ctx, taskUnrelated.ID, baseNow.Add(2*time.Second)); err != nil || unrelatedCancelled.Status != domain.TaskStatusCancelled {
+		close(releaseRelay)
+		t.Fatalf("expected unrelated task cancel unblocked, got task=%+v err=%v", unrelatedCancelled, err)
+	}
+
+	cancelDone := make(chan error, 1)
+	go func() {
+		got, cancelErr := store.CancelTask(ctx, taskRaced.ID, baseNow.Add(3*time.Second))
+		if cancelErr == nil && got.Status != domain.TaskStatusCancelled {
+			cancelErr = fmt.Errorf("expected CANCELLED, got %s", got.Status)
+		}
+		cancelDone <- cancelErr
+	}()
+
+	// Relay 尚未释放行锁前，taskRaced 的 CancelTask 必须保持阻塞等待。
+	select {
+	case err := <-cancelDone:
+		close(releaseRelay)
+		t.Fatalf("CancelTask returned before delayed relay committed its outbox row lock (err=%v)", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	// 放行 Relay 提交后，CancelTask 立即解除阻塞并干净提交 CANCELLED。
+	close(releaseRelay)
+	if err := <-relayDone; err != nil {
+		t.Fatalf("delayed relay failed: %v", err)
+	}
+	select {
+	case err := <-cancelDone:
+		if err != nil {
+			t.Fatalf("CancelTask after relay release failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for CancelTask to unblock after relay commit")
+	}
+}

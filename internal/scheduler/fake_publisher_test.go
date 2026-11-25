@@ -3,22 +3,25 @@ package scheduler_test
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
 
 type fakeReadyPublisher struct {
-	mu          sync.Mutex
-	published   []uuid.UUID
-	failErrs    []error
-	hasDeadline bool
-	onPublish   func(taskIDs []uuid.UUID, total int) error
+	mu           sync.Mutex
+	published    []uuid.UUID
+	failErrs     []error
+	hasDeadline  bool
+	lastDeadline time.Time
+	onPublish    func(ctx context.Context, taskIDs []uuid.UUID, total int) error
 }
 
 func (f *fakeReadyPublisher) PublishTaskIDs(ctx context.Context, taskIDs []uuid.UUID) error {
-	_, hasDeadline := ctx.Deadline()
+	deadline, hasDeadline := ctx.Deadline()
 	f.mu.Lock()
 	f.hasDeadline = hasDeadline
+	f.lastDeadline = deadline
 	if len(f.failErrs) > 0 {
 		err := f.failErrs[0]
 		f.failErrs = f.failErrs[1:]
@@ -26,7 +29,7 @@ func (f *fakeReadyPublisher) PublishTaskIDs(ctx context.Context, taskIDs []uuid.
 		total := len(f.published)
 		f.mu.Unlock()
 		if cb != nil {
-			_ = cb(taskIDs, total)
+			_ = cb(ctx, taskIDs, total)
 		}
 		return err
 	}
@@ -35,7 +38,7 @@ func (f *fakeReadyPublisher) PublishTaskIDs(ctx context.Context, taskIDs []uuid.
 	cb := f.onPublish
 	f.mu.Unlock()
 	if cb != nil {
-		return cb(taskIDs, total)
+		return cb(ctx, taskIDs, total)
 	}
 	return nil
 }
@@ -48,8 +51,8 @@ func (f *fakeReadyPublisher) snapshot() []uuid.UUID {
 	return out
 }
 
-func (f *fakeReadyPublisher) lastHasDeadline() bool {
+func (f *fakeReadyPublisher) lastDeadlineInfo() (time.Time, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.hasDeadline
+	return f.lastDeadline, f.hasDeadline
 }

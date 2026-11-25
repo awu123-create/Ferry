@@ -17,9 +17,9 @@ const (
 	// MinTaskMaxAttempts 与 MaxTaskMaxAttempts 定义 Task.MaxAttempts 的合法闭区间（与数据库 CHECK 约束一致）。
 	MinTaskMaxAttempts = 1
 	MaxTaskMaxAttempts = 20
-	// maxFutureDeliveryWindow 限制创建 Task 时允许预约的最远未来投递跨度（闭区间，防误传时间戳长期占池）。
+	// maxFutureDeliveryWindow 限制创建 Task 时最多只能预约未来 30 天内（含 30 天整），防止误传很远的未来时间长期占着延迟池。
 	maxFutureDeliveryWindow = 30 * 24 * time.Hour
-	// EarlyArrivalClockSkewTolerance 容忍跨机器间小幅时钟偏差，避免刚创建的立即任务被 Worker 误判为早到。
+	// EarlyArrivalClockSkewTolerance 给立即任务留出 1s 的机器时间误差容忍，避免刚创建就因为 Worker 时钟稍慢被当成没到点。
 	EarlyArrivalClockSkewTolerance = 1 * time.Second
 )
 
@@ -236,21 +236,22 @@ func (t Task) VerifyIdempotentReplay(endpointID uuid.UUID, idempotencyKey, paylo
 	return nil
 }
 
-// EvaluatePreDelivery 在 Worker Step B 发起出站 HTTP 投递前执行前置守卫检查。
+// EvaluatePreDelivery 在 Worker 真正发起 HTTP 请求前，检查当前 Task 能不能投递。
 //
-// 契约要求（ADR-0007 & ADR-0008）：
-//   - 若 t.Status.IsTerminal()：返回 PreDeliveryDecision{AlreadyFinal: true}, nil。
-//   - 若 now + EarlyArrivalClockSkewTolerance 早于 t.NextRunAt：返回 PreDeliveryDecision{EarlyArrival: true}, nil。
-//   - 若 !ep.Enabled：返回 PreDeliveryDecision{DeadLetterCode: DeadLetterReasonEndpointDisabled}, nil。
-//   - 若 !now.Before(t.DeadlineAt)：返回 PreDeliveryDecision{DeadLetterCode: DeadLetterReasonDeadlineExceeded}, nil。
-//   - 其余情况返回 PreDeliveryDecision{ShouldDeliver: true}, nil。
+// 判定顺序（见 docs/adr/0007-tactical-ddd-and-deep-module-seams.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）：
+//   - 已经处于终态（成功/死信/取消）：返回 AlreadyFinal = true，直接跳过。
+//   - 还没到执行时间：预约任务和重试任务严格要求 now >= NextRunAt；立即任务允许最多 1s 的机器时间误差，
+//     不满足时返回 EarlyArrival = true，交回延迟池等待。
+//   - 目标 Endpoint 已禁用：返回 DeadLetterCode = DeadLetterReasonEndpointDisabled。
+//   - 已超过 DeadlineAt：返回 DeadLetterCode = DeadLetterReasonDeadlineExceeded。
+//   - 其余情况返回 ShouldDeliver = true，放行投递。
 func (t Task) EvaluatePreDelivery(ep Endpoint, now time.Time) (PreDeliveryDecision, error) {
 	ts := now.UTC()
 
 	switch {
 	case t.Status.IsTerminal():
 		return PreDeliveryDecision{AlreadyFinal: true}, nil
-	case ts.Add(EarlyArrivalClockSkewTolerance).Before(t.NextRunAt):
+	case t.isEarlyArrival(ts):
 		return PreDeliveryDecision{EarlyArrival: true}, nil
 	case !ep.Enabled:
 		return PreDeliveryDecision{DeadLetterCode: DeadLetterReasonEndpointDisabled}, nil
@@ -259,6 +260,13 @@ func (t Task) EvaluatePreDelivery(ep Endpoint, now time.Time) (PreDeliveryDecisi
 	default:
 		return PreDeliveryDecision{ShouldDeliver: true}, nil
 	}
+}
+
+func (t Task) isEarlyArrival(now time.Time) bool {
+	if t.NextRunAt.After(t.CreatedAt) || t.Attempt > 0 || t.Status == TaskStatusRetrying {
+		return now.Before(t.NextRunAt)
+	}
+	return now.Add(EarlyArrivalClockSkewTolerance).Before(t.NextRunAt)
 }
 
 // RecordOutcome 对出站 DeliveryResult 进行分级，演进 Task 状态并生成只追加 DeliveryAttempt 记录。

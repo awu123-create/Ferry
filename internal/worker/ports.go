@@ -45,9 +45,9 @@ type ExecutionLocker interface {
 	ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error
 }
 
-// DelayedScheduler 负责在抢锁争用或早到拦截时将任务写回延迟池。
+// DelayedScheduler 供 Worker 在抢锁失败或任务还没到点时把任务放回延迟池。
 type DelayedScheduler interface {
-	ScheduleDelayed(ctx context.Context, taskID uuid.UUID, runAt time.Time) error
+	ScheduleDelayed(ctx context.Context, taskID uuid.UUID, runAt time.Time, minDelay time.Duration) error
 	DeferContendedTask(ctx context.Context, taskID uuid.UUID, fallbackDelay time.Duration) error
 }
 

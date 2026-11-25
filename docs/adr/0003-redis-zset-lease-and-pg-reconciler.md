@@ -1,6 +1,6 @@
 # ADR-0003: 延迟与退避重试采用 Redis ZSet 租约倒计时池加 PG 对账兜底
 
-- **状态**：已采纳（部分细则已由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：拉长默认指数退避档位、Forwarder 改为比对租约分数条件 `ZREM`、Reconciler 改为游标循环排空并以 `ZADD NX` 回写延迟池）
+- **状态**：已采纳（部分细则已由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：拉长默认指数退避档位、Forwarder 改为校验 `ferry:delayed:lease` 租约簿与分数相等后条件 `HDEL + ZREM`、Reconciler 改为游标循环排空并以 `ZADD NX` 回写延迟池）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）
@@ -34,11 +34,11 @@ Kafka 本质上是面向即时吞吐的顺序追加日志，不支持按任意�
    - `ferry:delayed` 仅存储 36 字节 UUID 字符串 `task_id`，完整任务载荷与 HTTP 头只存储一份在 PG `tasks` 表中，避免内存放大与双份数据不一致。
 2. **Forwarder 30 秒租约（Visibility Timeout）防崩协议**：
    - 严禁“先 `ZPOPMIN` 删除再写 Kafka”，否则两步之间进程崩溃即永久丢消息；
-   - Forwarder 每 `100ms` 执行 Lua 脚本 `claim_delayed.lua`：
+   - Forwarder 每 `100ms` 在单轮共享硬超时（`<= min(5s, LeaseTTL/2)`）内执行原子 Lua 脚本领取到期批次：
      1. `ZRANGEBYSCORE ferry:delayed -inf <now_ms> LIMIT 0 100` 取出一批到期任务；
-     2. 对该批任务原子执行 `ZADD ferry:delayed XX <lease_until_ms> <task_id>`（将 `score` 推迟 30 秒作为处理租约）；
+     2. 对该批任务原子执行 `ZADD ferry:delayed XX <lease_until_ms> <task_id>`（将 `score` 推迟 30 秒作为处理租约）并 `HSET ferry:delayed:lease <task_id> <lease_until_ms>` 登记本轮租约；
      3. 返回该批 `task_id` 与本次 `lease_until_ms` 给 Go 进程。
-   - Go 进程将这批 `task_id` 批量发往 Kafka `ferry.tasks.ready`（`acks=all`），收到 Broker 确认后再执行确认删除——初版曾直接执行无条件 `ZREM`，现行实现改由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 规定的 Lua 条件删除（仅当 `ZSCORE == lease_until_ms` 时才 `ZREM`），防止误删期间被 Worker 新写入的顺延或退避计划；
+   - Go 进程将这批 `task_id` 批量发往 Kafka `ferry.tasks.ready`（`acks=all`），收到 Broker 确认后再执行确认删除——初版曾直接执行无条件 `ZREM`，现行实现改由 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 规定的 Lua 条件删除（仅当 `ferry:delayed:lease` 仍登记本轮 `lease_until_ms` 且 `ZSCORE == lease_until_ms` 时才 `HDEL + ZREM`），防止误删并发期间被 Worker 覆写或争用替换的排期；
    - 若 Forwarder 在写 Kafka 前崩溃或发生网络分区，该批任务在 30 秒租约过期后会自动重新变为到期状态，被其他实例安全捞起。
 3. **PG Reconciler 低频对账自愈（兜底 Redis 极端丢失）**：
    - 利用 PG `tasks` 表的部分索引 `tasks_reconcile_idx (next_run_at ASC, id ASC) WHERE status IN ('PENDING', 'RETRYING')`（体积极小，终态行不进索引），每 `60s` 扫描到期超过宽限期的卡滞任务；

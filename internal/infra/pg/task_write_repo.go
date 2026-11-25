@@ -2,6 +2,7 @@ package pg
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -133,29 +134,58 @@ func (s *Store) SaveDeliveryOutcome(
 	return applied, nil
 }
 
-// CancelTask 在调用方已持有 Redis Execution Lock 的前提下，
-// 原子将非终态（PENDING 或 RETRYING）的 Task 迁移为 CANCELLED（ADR-0007 & ADR-0008）。
+// CancelTask 在调用方已经拿到 Redis Execution Lock 的前提下，
+// 在同一个 PostgreSQL 事务里把还没结束的 Task（PENDING 或 RETRYING）改成 CANCELLED，并顺手删掉还没发走的 outbox 记录
+// （见 docs/adr/0007-tactical-ddd-and-deep-module-seams.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (s *Store) CancelTask(ctx context.Context, taskID uuid.UUID, now time.Time) (domain.Task, error) {
 	ts := now.UTC()
-	res := s.db.WithContext(ctx).Model(&taskPO{}).Where("id = ? AND status IN ('PENDING', 'RETRYING')", taskID).Updates(map[string]any{
-		"status":       string(domain.TaskStatusCancelled),
-		"completed_at": ts,
-		"updated_at":   ts,
+	var cancelled domain.Task
+
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&taskPO{}).
+			Where("id = ? AND status IN ('PENDING', 'RETRYING')", taskID).
+			Updates(map[string]any{
+				"status":       string(domain.TaskStatusCancelled),
+				"completed_at": ts,
+				"updated_at":   ts,
+			})
+		if res.Error != nil {
+			return fmt.Errorf("cancel task: %w", res.Error)
+		}
+
+		if res.RowsAffected == 1 {
+			// 在同一个事务里删掉这条任务的 outbox：
+			// 如果 OutboxRelay 还没领走，这里直接删掉，后面不会再进延迟池；
+			// 如果 OutboxRelay 正锁着这行往 Redis 写，这里会等它提交完再继续，保证外层随后删 Redis 一定发生在写入之后。
+			if err := tx.Where("task_id = ?", taskID).Delete(&outboxPO{}).Error; err != nil {
+				return fmt.Errorf("delete cancelled task outbox: %w", err)
+			}
+		}
+
+		var po taskPO
+		err := tx.Where("id = ?", taskID).First(&po).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return domain.ErrTaskNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("select task after cancel: %w", err)
+		}
+		task, err := toDomainTask(po)
+		if err != nil {
+			return fmt.Errorf("decode task after cancel: %w", err)
+		}
+
+		if res.RowsAffected == 1 {
+			cancelled = task
+			return nil
+		}
+		if task.Status.IsTerminal() {
+			return domain.ErrTaskNotCancellable
+		}
+		return fmt.Errorf("cancel task %s: concurrent state transition (status=%s): %w", taskID, task.Status, domain.ErrTaskNotCancellable)
 	})
-	if res.Error != nil {
-		return domain.Task{}, fmt.Errorf("cancel task: %w", res.Error)
-	}
-
-	if res.RowsAffected == 1 {
-		return s.GetTask(ctx, taskID)
-	}
-
-	task, err := s.GetTask(ctx, taskID)
 	if err != nil {
 		return domain.Task{}, err
 	}
-	if task.Status.IsTerminal() {
-		return domain.Task{}, domain.ErrTaskNotCancellable
-	}
-	return domain.Task{}, fmt.Errorf("cancel task %s: concurrent state transition (status=%s): %w", taskID, task.Status, domain.ErrTaskNotCancellable)
+	return cancelled, nil
 }

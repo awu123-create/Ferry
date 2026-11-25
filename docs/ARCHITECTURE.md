@@ -37,7 +37,7 @@
 | :--- | :--- | :--- | :--- |
 | **PostgreSQL** | 唯一业务真相、入口幂等防重、事务 Outbox、投递审计流水、状态机最终仲裁 | `endpoints`、`tasks`、`task_attempts`、`outbox` | 不可丢失（依赖 PG WAL 与持久化卷，单点真源） |
 | **Kafka** (KRaft) | 调度与派发异步解耦、消费组水平扩缩容与分区级 `Pause` 背压（`acks=all`、至少一次投递） | Topic `ferry.tasks.ready`（多分区，固定按 `task_id` 哈希分区） | 可自愈（未搬运还在 `outbox`；已搬运未完成由 Reconciler 补回延迟池后重发） |
-| **Redis** | 任意时刻延迟倒计时池、Endpoint 级三维流控（熔断/虚拟排号限流/并发槽位）、Worker 执行互斥锁 | `ferry:delayed` (ZSet)、`ferry:lock:task:<id>` (String NX PX)、`ferry:cb:<ep>` (Hash)、`ferry:rl:<ep>` (Hash)、`ferry:inflight:<ep>` (ZSet) | **可完全自愈**（即使 `FLUSHALL` 清空内存，`60s` PG Reconciler 游标流式扫描在途 `PENDING`/`RETRYING` 任务并回灌延迟池恢复） |
+| **Redis** | 任意时刻延迟倒计时池、Endpoint 级三维流控（熔断/虚拟排号限流/并发槽位）、Worker 执行互斥锁 | `ferry:delayed` (ZSet)、`ferry:delayed:lease` (Hash)、`ferry:delayed:cancelled:<id>` (String PX)、`ferry:lock:task:<id>` (String NX PX)、`ferry:cb:<ep>` (Hash)、`ferry:rl:<ep>` (Hash)、`ferry:inflight:<ep>` (ZSet) | **可完全自愈**（即使 `FLUSHALL` 清空内存，`60s` PG Reconciler 游标流式扫描在途 `PENDING`/`RETRYING` 任务并回灌延迟池恢复） |
 
 ### 3.2 完整端到端数据流（ASCII 架构图）
 
@@ -49,8 +49,8 @@
 +---------------------------------------------------------------------------------+
 |                         ferry-server (API + Control)                            |
 |                                                                                 |
-|  1. 校验 Endpoint 启用状态与合法 JSON，保留原始字节计算 payload_sha256            |
-|  2. PG 单事务原子写入 (deadline_at 默认首次 next_run_at + 24h):                  |
+|  1. 校验 Endpoint 启用状态、合法 JSON 与 deliver_at <= now+30d，保真计算 sha256  |
+|  2. PG 单事务原子写入 (deadline_at 默认 max(next_run_at, now) + 24h):            |
 |     - tasks (UNIQUE(endpoint_id, idempotency_key), payload=BYTEA, status=PENDING)|
 |     - outbox (task_id, deliver_at)                                              |
 |     - COMMIT 后触发 pg_notify('ferry_outbox', '')                                |
@@ -69,30 +69,32 @@
    | 双通道按 deliver_at 拆 |                                  |                  |
    +-----------------------+                                  |                  |
      |                   |                                    |                  |
-     | 立即通道 <= now()  | 延迟通道 > now()                    |                  |
+     | 立即通道 <= now()  | 延迟通道 > now() && > created_at   |                  |
      | (独立直推，无视Redis)| (Redis断连时独立退避，不堵立即通道) |                  |
-     | (Kafka acks=all   |                                    | (Redis Pipeline   |
-     |  确认后 DELETE)    +-----------------------------+      |  ZADD 后 DELETE) |
+     | (Kafka acks=all   |                                    | (原子批量 ZADD +  |
+     |  确认后 DELETE)    +-----------------------------+      |  清租约后 DELETE) |
      v                                                 v      |                  |
 +--------------------------+              +-------------------+----------------+ |
-| Kafka: ferry.tasks.ready |<-------------| Redis ZSet: ferry:delayed          | |
+| Kafka: ferry.tasks.ready |<-------------| Redis: ferry:delayed + lease Hash  | |
 | (固定按 task_id 分区)     |  100ms 轮询   | member=task_id, score=run_at_ms    | |
 +--------------------------+  Lua 续租30s  +------------------------------------+ |
-     |                    比对分数条件ZREM     ^                ^                |
-     v                                        | 虚拟排号顺延    | 指数退避/429    |
+     |                    单轮超时<=租约一半     ^                ^                |
+     v                    校验租约条件 ZREM     | 虚拟排号顺延    | 指数退避/429    |
 +---------------------------------------------+----------------+--------------+ |
 |                          ferry-worker (Kafka Consumer)                       | |
 |                                                                              | |
-|  Step A: SET ferry:lock:task:<id> <token> NX PX 抢执行锁 (争用则 ZADD NX 保底)| |
-|  Step B: 查 PG tasks + 3s 短缓存 Endpoint；早于 next_run_at 则回写延迟池跳过；| |
-|          若已终态直接确认；若禁用或超 deadline_at -> 乐观锁 CAS 转 DLQ        | |
+|  Step A: SET ferry:lock:task:<id> <token> NX PX 抢执行锁                      | |
+|          (争用时先查 PG 终态，未终态经 Lua 校验取消墓碑后写保底唤醒点再 Ack)    | |
+|  Step B: 查 PG tasks + 3s 短缓存 Endpoint；早到拦截(预约/退避严格 now<next,   | |
+|          立即保留 1s 容差) -> 覆写延迟池并清租约 -> 单 defer 放锁再 Ack；      | |
+|          若已终态放锁确认；若禁用或超 deadline_at -> 乐观锁 CAS 转 DLQ         | |
 |  Step C: Lua [admit_endpoint.lua] (AdmitOrDefer, Redis TIME):                | |
 |          1) 熔断检查 (含 HALF_OPEN 探测超时) -> 2) QPS 虚拟排号 next_free_ms  | |
 |          3) ZSet 并发槽位 -> 未通过则按 1/QPS 排号顺延 (超 deadline 直转 DLQ) | |
 |  Step D: 原样发送 BYTEA 载荷 + X-Ferry-Task-ID + HMAC-SHA256 签名头           | |
 |  Step E: PG 单事务写 task_attempts(含 replay_count) + (replay_count, attempt) | |
 |          乐观版本 CAS 流转；提交后调 CompleteDelivery 归还槽位/更新熔断与冷却 | |
-|          最后通过 Lua 校验 token 安全释放执行互斥锁                           | |
+|          内层单 defer 校验 token 放锁(瞬时报错记 Warn 靠 TTL)，外层再确认位移  | |
 +------------------------------------------------------------------------------+ |
      |                                                                           |
      v                                                                           |
@@ -107,7 +109,7 @@
 ### 3.3 有界回退与防空转证明（同时约束“环路频率”与“总存活时长”）
 
 1. **环路频率有界（杜绝大积压空转风暴）**：当某下游限流（如 `20 QPS`）或触发熔断 `OPEN` 且瞬间涌入上万条任务时，`admit_endpoint.lua` 不采用固定 `1s` 盲目重试，而是维护每个 `Endpoint` 的虚拟空闲游标 `next_free_ms`，按 `1 / rate_limit_qps`（如每单 `+50ms`）将积压任务依次排号分摊至未来时间轴。每条受限任务仅在轮到自身配额槽位时被唤醒一次，彻底消除高频回灌对 Forwarder、共享 Kafka Topic 与 PG 读库的无效消耗。
-2. **总存活时长有界（`deadline_at` 硬截断）**：每条任务在创建或重放时均记录 `deadline_at`（默认**首次 `next_run_at + 24h`**，支持环境变量覆盖）。无论在 Step B 唤醒校验、流控虚拟排号越界还是退避重试计算阶段，一旦越过 `deadline_at`，Worker 立即将其通过乐观版本 CAS 写为终态 `DEAD_LETTER`（`last_error = 'TTL_EXPIRED'`）并停止入池，从数学上保证调度环路绝对收敛。
+2. **总存活时长有界（`deadline_at` 硬截断）**：创建任务入站 `deliver_at` 限制在 `now + 30d` 闭区间内，每条任务在创建或重放时均记录 `deadline_at`（默认 **`max(next_run_at, now) + 24h`**，支持环境变量覆盖）。无论在 Step B 唤醒校验、流控虚拟排号越界还是退避重试计算阶段，一旦越过 `deadline_at`，Worker 立即将其通过乐观版本 CAS 写为终态 `DEAD_LETTER`（`last_error = 'TTL_EXPIRED'`）并停止入池，从数学上保证调度环路绝对收敛。
 
 ---
 
@@ -148,7 +150,7 @@
 | Worker 标记投递成功 (`SUCCEEDED`) | `PENDING`、`RETRYING` | 单事务内追加 `task_attempts`（含当前 `replay_count`）并执行 `WHERE id = $1 AND replay_count = $2 AND attempt = $3 AND status IN ('PENDING','RETRYING')`；极端锁超时与取消重叠时跳过状态覆盖但保留真实发生的审计行 |
 | Worker 标记失败重试 (`RETRYING`) | `PENDING`、`RETRYING` | 单事务追加 `task_attempts`、递增 `attempt`、写入退避后的 `next_run_at`（带复合乐观锁条件）；事务提交后再将 `task_id` 写入 `ferry:delayed`（极端断连由 Reconciler 兜底） |
 | Worker 标记死信 (`DEAD_LETTER`) | `PENDING`、`RETRYING` | 不可重试 4xx（写 `task_attempts`）、超过 `max_attempts`、下次退避或当前已超 `deadline_at`、或 `Endpoint` 禁用（未发 HTTP 时不写 `task_attempts`）时通过复合乐观锁 CAS 落入，记录 `completed_at` |
-| 手动取消 (`CANCELLED`) | `PENDING`、`RETRYING`（且抢占到 `Execution Lock`） | 自身先执行 `SET NX` 抢占 `Execution Lock`（抢不到说明正在执行，立即返回 `409 Conflict`）；持锁期间执行 `WHERE id = $1 AND status IN ('PENDING','RETRYING')` 置 `CANCELLED`、清理延迟池并验主释放锁 |
+| 手动取消 (`CANCELLED`) | `PENDING`、`RETRYING`（且抢占到 `Execution Lock`） | 自身先执行 `SET NX` 抢占 `Execution Lock`（抢不到说明正在执行，立即返回 `409 Conflict`）；持锁期间在单事务内执行 `WHERE id = $1 AND status IN ('PENDING','RETRYING')` 置 `CANCELLED` 并 `DELETE FROM outbox WHERE task_id = $1`（与在途 Outbox Relay 行锁串行），提交后由原子 Lua 写入固定 `10m` TTL 的取消标记 `ferry:delayed:cancelled:<id>` 并清理 `ferry:delayed` 与 `ferry:delayed:lease`，最后释放锁 |
 | 死信重放 (`DEAD_LETTER -> PENDING`) | `DEAD_LETTER` | 使用 `FOR UPDATE SKIP LOCKED` 加锁更新 `status='PENDING', attempt=0, replay_count=replay_count+1, next_run_at=now(), deadline_at=now()+default_ttl`, 并同事务写 `outbox` |
 
 ---
@@ -186,7 +188,7 @@ CREATE TABLE tasks (
     attempt         INT NOT NULL DEFAULT 0,
     max_attempts    INT NOT NULL DEFAULT 6 CHECK (max_attempts BETWEEN 1 AND 20),
     next_run_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
-    deadline_at     TIMESTAMPTZ NOT NULL, -- 应用层默认按首次 next_run_at + 默认有效窗口(24h，环境变量可配)赋值
+    deadline_at     TIMESTAMPTZ NOT NULL, -- 应用层默认按 max(next_run_at, now) + 默认有效窗口(24h，环境变量可配)赋值
     last_error      TEXT NOT NULL DEFAULT '',
     replay_count    INT NOT NULL DEFAULT 0,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -231,7 +233,7 @@ CREATE TABLE outbox (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- 复合索引支撑立即通道 (deliver_at <= now()) 与延迟通道 (deliver_at > now()) 独立无阻塞扫描
+-- 复合索引支撑立即通道 (deliver_at <= now()) 与延迟通道 (deliver_at > now() AND deliver_at > created_at) 独立无阻塞扫描
 CREATE INDEX outbox_deliver_idx ON outbox (deliver_at ASC, id ASC);
 
 -- Outbox 插入后自动触发 NOTIFY，避免业务层手写 pg_notify SQL
@@ -259,7 +261,7 @@ CREATE TRIGGER outbox_notify_trg
 | **2. Redis 不可用（分两阶段）** | ① **断连拒绝服务期间**：无法读/写熔断、限流、信号量与 `ferry:delayed`；<br>② **宕机重启内存清空后**：ZSet 倒计时任务全部蒸发 | ① **断连期间双通道隔离与 Fail-Safe**：入口 `POST /v1/tasks` 只依赖 PG 照常接单；Outbox 立即通道（`deliver_at <= now()`）完全不碰 Redis 照常直推 Kafka，延迟通道独立退避不堵队头；Worker 检测到连续 Redis 失败立即**暂停拉取 Kafka** 并让出 `/readyz`；<br>② **清空恢复后自愈**：`60s` PG Reconciler 游标循环扫完 `next_run_at < now()-60s` 且不在 Redis 中的在途任务，通过 `ZADD NX` 批量回灌延迟池恢复转发，做到**零丢单** |
 | **3. 下游持续超时（10s）或 5xx 风暴** | 单慢接口占满全局 HTTP 协程或制造空转风暴（Noisy Neighbor） | 1. 前 `max_concurrency` 个在途请求触发超时，连续可重试失败达 `circuit_threshold`（默认 `30`）后 `ferry:cb:<ep>` 切为 `OPEN 30s`（收到 `429 Retry-After` 同样推迟 Endpoint 冷却窗口）；<br>2. 后续到达的同 Endpoint 任务在 `admit_endpoint.lua` 微秒级被拒，不增 `attempt`，按 `1/rate_limit_qps` 虚拟排号游标 `next_free_ms` 均匀摊开写回 `ferry:delayed`，既释放 Worker 协程又消除高频空转；<br>3. 冷却后放行 **1 个带过期保护**的 `HALF_OPEN` 试探请求，通则恢复 `CLOSED`，不通继续 `OPEN`；超 `max_attempts` 或 `deadline_at` 安全落入 `DEAD_LETTER`，恢复后经 `POST /v1/dlq/replay` 平滑重放 |
 | **4. Worker 收到 `SIGTERM` 优雅停机** | 在途 HTTP 请求被腰斩、已发完的 Offset 未提交、未发完的却先提交了 Offset | 1. 收到 `SIGTERM` 立即将 `/readyz` 置为 `503`（通知外部摘流）并停止从 Kafka `Poll` 新消息；<br>2. 等待 `WaitGroup` 排空所有正在执行 HTTP 请求的协程（设置 `25s` 优雅上限），让其完整写完 `task_attempts` 与 `tasks` 状态，调用 `CompleteDelivery` 归还并发槽位并验主释放执行锁；<br>3. 仅提交已完整处理的连续 Kafka Offset 后关闭连接退出；<br>4. 若超过 `25s` 仍未排空被迫退出，未提交 Offset 的消息在 Kafka Rebalance 后重发，且旧槽位将在 `timeout_ms + 5s` 自动过期释放 |
-| **5. Worker 执行中遭遇 `kill -9` / OOM 强杀** | 未能执行清理并发槽位与删锁逻辑，且重平衡消息可能撞上未过期旧锁 | `ferry:inflight:<ep>` 槽位与 `HALF_OPEN` 试探名额均携带到期时间戳自动失效回收；新 Worker 收到重平衡消息若遇旧 `Execution Lock` 尚未过期，不丢弃消息而是通过 `ZADD NX` 在延迟池埋下保底唤醒点后再确认 Offset，锁过期后立即无缝续接，**绝不死锁或漏单** |
+| **5. Worker 执行中遭遇 `kill -9` / OOM 强杀** | 未能执行清理并发槽位与删锁逻辑，且重平衡消息可能撞上未过期旧锁 | `ferry:inflight:<ep>` 槽位与 `HALF_OPEN` 试探名额均携带到期时间戳自动失效回收；新 Worker 收到重平衡消息若遇旧 `Execution Lock` 尚未过期，先查 PG 排除终态，活跃态再通过原子 Lua 校验取消标记后在延迟池写入保底唤醒点（若池中仅剩 Forwarder 临时租约则覆盖并删掉租约记录）再确认 Offset，锁过期后立即无缝续接，**绝不死锁或漏单** |
 | **6. 下游已业务处理成功，但回传 `200 OK` 时断网** | Ferry 判定网络超时并按退避规则重新投递 | 遵循网络投递“至少一次”客观定理，每次投递强制携带同一 `X-Ferry-Task-ID` 与 `X-Ferry-Signature`，下游以 `X-Ferry-Task-ID` 为幂等键去重，保证业务结果“精确一次” |
 
 ### 6.2 最脆弱假设（Premise Collapse）与 10x 流量扩展瓶颈
@@ -286,7 +288,7 @@ CREATE TRIGGER outbox_notify_trg
 | **主键生成** | **`google/uuid`**（`uuid.NewV7()`） | 按时间戳递增有序，防止高并发 `UUIDv4` 随机写引发 PG B-Tree 索引页分裂 |
 | **HTTP 路由与投递** | **标准库 `net/http`**（Go 1.22+ 增强 `ServeMux` + 定制 `http.Transport`） | 零 Web 框架承载 REST API；定制连接池（`MaxIdleConns: 1000`、`MaxIdleConnsPerHost: 64`）与 `io.LimitReader` 防大响应体 OOM |
 | **Kafka 客户端** | **`twmb/franz-go`**（含 `pkg/kadm`） | 纯 Go 零 CGO，默认开启幂等生产者，支持 `CooperativeSticky` 重平衡与分区级 `PauseFetchPartitions` 背压 |
-| **Redis 客户端** | **`redis/go-redis/v9`** | 驱动 `ferry:delayed` ZSet、Pipeline、短锁与 `redis.NewScript`（自动 `EVALSHA` / `NOSCRIPT` 重载） |
+| **Redis 客户端** | **`redis/go-redis/v9`** | 驱动 `ferry:delayed` ZSet、`ferry:delayed:lease` Hash、`ferry:delayed:cancelled:<id>` 取消标记、短锁与 `redis.NewScript`（自动 `EVALSHA` / `NOSCRIPT` 重载） |
 | **结构化日志** | **`go.uber.org/zap`** | JSON 格式输出；启用 `zapcore.NewSamplerWithOptions` 防下游雪崩刷爆磁盘 I/O，并实现 GORM `logger.Interface` 接管慢 SQL 阈值告警与 `task_id` 透传 |
 | **配置、组装与指标** | **纯环境变量结构体 + `main.go` 显式组装 + `prometheus/client_golang`** | 12-Factor 强类型环境变量解析（零 `viper`/`fx`），优雅停机逆序显式可控，独立暴露 `/metrics` |
 | **本地容器栈** | `postgres:16-alpine` + `apache/kafka:3.9.0` (KRaft) + `redis:7.4-alpine` (`--maxmemory-policy noeviction`) + `prom/prometheus` + `grafana/grafana` | Docker Compose 一键编排，无 ZooKeeper |

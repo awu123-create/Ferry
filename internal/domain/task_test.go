@@ -305,3 +305,96 @@ func TestNewTask_DeliverAtWindowBounds(t *testing.T) {
 		}
 	})
 }
+
+func TestTask_EvaluatePreDeliveryStrictForScheduledAndRetryingTasks(t *testing.T) {
+	now := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	ep, err := domain.NewEndpoint(domain.NewEndpointParams{
+		Name:      "scheduled-guard",
+		TargetURL: "http://localhost:8081/webhook",
+	}, now)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %v", err)
+	}
+
+	futureDeliverAt := now.Add(10 * time.Second)
+	scheduled, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: "sched-strict-1",
+		RawPayload:     []byte(`{"k":1}`),
+		DeliverAt:      &futureDeliverAt,
+		MaxAttempts:    3,
+		DefaultWindow:  time.Hour,
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("NewTask(scheduled) failed: %v", err)
+	}
+
+	immediate, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: "imm-skew-1",
+		RawPayload:     []byte(`{"k":1}`),
+		MaxAttempts:    3,
+		DefaultWindow:  time.Hour,
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("NewTask(immediate) failed: %v", err)
+	}
+
+	retrying := immediate
+	retrying.Status = domain.TaskStatusRetrying
+	retrying.Attempt = 1
+	retrying.NextRunAt = now.Add(5 * time.Second)
+
+	cases := []struct {
+		name              string
+		task              domain.Task
+		evalNow           time.Time
+		wantEarlyArrival  bool
+		wantShouldDeliver bool
+	}{
+		{
+			name:             "scheduled_500ms_early_blocked",
+			task:             scheduled,
+			evalNow:          futureDeliverAt.Add(-500 * time.Millisecond),
+			wantEarlyArrival: true,
+		},
+		{
+			name:             "scheduled_1ms_early_blocked",
+			task:             scheduled,
+			evalNow:          futureDeliverAt.Add(-time.Millisecond),
+			wantEarlyArrival: true,
+		},
+		{
+			name:              "scheduled_exact_due_allowed",
+			task:              scheduled,
+			evalNow:           futureDeliverAt,
+			wantShouldDeliver: true,
+		},
+		{
+			name:             "retrying_500ms_early_blocked",
+			task:             retrying,
+			evalNow:          retrying.NextRunAt.Add(-500 * time.Millisecond),
+			wantEarlyArrival: true,
+		},
+		{
+			name:              "immediate_500ms_clock_skew_allowed",
+			task:              immediate,
+			evalNow:           now.Add(-500 * time.Millisecond),
+			wantShouldDeliver: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := tc.task.EvaluatePreDelivery(ep, tc.evalNow)
+			if err != nil {
+				t.Fatalf("EvaluatePreDelivery failed: %v", err)
+			}
+			if decision.EarlyArrival != tc.wantEarlyArrival || decision.ShouldDeliver != tc.wantShouldDeliver {
+				t.Fatalf("got decision=%+v, want EarlyArrival=%v ShouldDeliver=%v", decision, tc.wantEarlyArrival, tc.wantShouldDeliver)
+			}
+		})
+	}
+}
