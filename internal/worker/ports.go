@@ -45,6 +45,12 @@ type ExecutionLocker interface {
 	ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error
 }
 
+// DelayedScheduler 供 Worker 在抢锁失败或任务还没到点时把任务放回延迟池。
+type DelayedScheduler interface {
+	ScheduleDelayed(ctx context.Context, taskID uuid.UUID, runAt time.Time, minDelay time.Duration) error
+	DeferContendedTask(ctx context.Context, taskID uuid.UUID, fallbackDelay time.Duration) error
+}
+
 // HTTPSender 发起出站 HTTP POST 投递并汇总本次尝试结果。
 type HTTPSender interface {
 	Send(ctx context.Context, req domain.DeliveryRequest) domain.DeliveryResult

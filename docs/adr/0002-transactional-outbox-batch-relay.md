@@ -36,7 +36,7 @@
    - 新建任务成功则在同一事务内写入 `outbox(task_id, deliver_at)`，事务提交后由 `goose` 迁移脚本挂载在 `outbox` 表上的 `AFTER INSERT` 触发器自动执行 `pg_notify('ferry_outbox', '')`，无需业务代码手写通知 SQL。
 2. **双触发批量搬运与分流路由**：
    - Relay 协程复用底层 `pgx` 连接调用 `WaitForNotification` 监听 `ferry_outbox` 通道，收到通知或 `500ms` 定时器触发后通过 GORM `clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}` 按批拉取，直到 `outbox` 排空；
-   - _演进说明_：初版曾按单通道 `ORDER BY id ASC LIMIT 100` 混取立即/延迟任务且未固定 Kafka 分区键；现行取数协议、复合索引与事务超时统一以 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 为准——拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka，固定以 `task_id` 为分区键，`acks=all` 确认后物理删除）与**延迟通道**（`deliver_at > now()` 通过 Redis Pipeline 批量 `ZADD ferry:delayed` 确认后删除），升级复合索引 `outbox_deliver_idx (deliver_at ASC, id ASC)`，并对单批回调事务绑定 `5s` 硬超时防长事务阻塞 Autovacuum。
+   - _演进说明_：初版曾按单通道 `ORDER BY id ASC LIMIT 100` 混取立即/延迟任务且未固定 Kafka 分区键；现行取数协议、复合索引与事务超时统一以 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 为准——拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka，固定以 `task_id` 为分区键，`acks=all` 确认后物理删除）与**延迟通道**（`deliver_at > now() AND deliver_at > created_at`，通过原子批量 Lua 脚本将到期时间戳写入 `ferry:delayed` 并清除 `ferry:delayed:lease` 残留租约标记，确认后物理删除），升级复合索引 `outbox_deliver_idx (deliver_at ASC, id ASC)`，并对单批回调事务绑定 `5s` 硬超时防长事务阻塞 Autovacuum。
 3. **Redis 不可用时的 Relay 隔离保护**：
    - 当 Redis 不可用时，立即通道照常推 Kafka 并物理删除对应 `outbox` 行，延迟通道独立退避且不阻塞立即通道（见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）；待 Redis 恢复或 `deliver_at` 到期转入立即通道时自动续接。
 

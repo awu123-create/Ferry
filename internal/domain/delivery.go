@@ -76,3 +76,15 @@ type ReadyDelivery struct {
 	TaskID uuid.UUID
 	Ack    func()
 }
+
+// OutboxItem 表示延迟通道从发件箱取出、待写入延迟池的单条记录。
+type OutboxItem struct {
+	TaskID    uuid.UUID
+	DeliverAt time.Time
+}
+
+// DelayedLeaseBatch 打包这一轮从延迟池取出的 Task ID，以及这批任务对应的 Schedule Lease 到期时间（毫秒）。
+type DelayedLeaseBatch struct {
+	TaskIDs      []uuid.UUID
+	LeaseUntilMs int64
+}

@@ -35,8 +35,8 @@ func TestGracefulShutdownIntegration(t *testing.T) {
 	}))
 	defer downstream.Close()
 
-	h.startRelay()
-	h.startWorker()
+	h.relayRunner.start()
+	h.workerRunner.start()
 
 	ep := h.createEndpoint("slow-shutdown", downstream.URL+"/slow", "", 10000)
 	code, body := h.doJSON(http.MethodPost, "/v1/tasks",
@@ -64,7 +64,7 @@ func TestGracefulShutdownIntegration(t *testing.T) {
 	}
 
 	// 触发停机取消（模拟 SIGTERM），确认就绪状态立即摘除且不会中断在途 HTTP。
-	workerDone := h.triggerWorkerShutdown()
+	workerDone := h.workerRunner.triggerStop()
 	waitUntil(t, 2*time.Second, "worker.Ready() flips to false immediately", func() bool {
 		return !h.worker.Ready()
 	})

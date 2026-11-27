@@ -34,7 +34,7 @@ Ferry 的总体架构与可靠性契约已在 [ADR-0001](./0001-unified-http-tas
 | **主键生成** | **`google/uuid`**（`uuid.NewV7()`） | 时间序有序主键，防止高并发随机 `UUIDv4` 写入引发 PG B-Tree 索引页分裂 |
 | **HTTP 路由与投递** | **标准库 `net/http`**（增强 `ServeMux` + 定制 `http.Transport`） | 零框架承载 ~9 个 REST 接口；投递端手动调优连接池（`MaxIdleConns: 1000`、`MaxIdleConnsPerHost: 64`、`IdleConnTimeout: 90s`）并使用 `io.LimitReader` 截断大响应体防 OOM |
 | **Kafka 客户端** | **`twmb/franz-go`**（含 `pkg/kadm`） | 纯 Go 零 CGO，原生默认启用幂等生产者、`CooperativeSticky` 重平衡及分区级 `PauseFetchPartitions`（直接支撑 ADR-0004 Redis 断连背压暂停） |
-| **Redis 客户端** | **`redis/go-redis/v9`** | 驱动 `ferry:delayed` ZSet、Pipeline、短锁与 `redis.NewScript`（自动 `EVALSHA` 并在 `FLUSHALL`/重启 `NOSCRIPT` 后自动重载 `EVAL`） |
+| **Redis 客户端** | **`redis/go-redis/v9`** | 驱动 `ferry:delayed` ZSet、`ferry:delayed:lease` Hash、取消标记、短锁与 `redis.NewScript`（自动 `EVALSHA` 并在 `FLUSHALL`/重启 `NOSCRIPT` 后自动重载 `EVAL`） |
 | **结构化日志** | **`go.uber.org/zap`** | JSON 格式输出；启用 `zapcore.NewSamplerWithOptions` 防下游雪崩刷屏拖垮磁盘；实现 GORM `logger.Interface` 接管慢 SQL 阈值告警（如 `> 200ms`）并透传 `task_id` |
 | **配置与组装** | **环境变量结构体 + `main.go` 显式构造** | 12-Factor 纯环境变量强校验，不引 `viper`/`fx`，保证优雅停机逆序排空路径完全显式可读 |
 | **指标与容器栈** | **`prometheus/client_golang`**；`postgres:16-alpine`、`apache/kafka:3.9.0` (KRaft)、`redis:7.4-alpine` (`--maxmemory-policy noeviction`) | 独立暴露 `:2112`/`:2113` `/metrics`；Redis 强制禁止内存淘汰以保护 `ferry:delayed` |

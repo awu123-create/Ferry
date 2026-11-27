@@ -31,9 +31,9 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 ## 核心机制与可靠性特性（Core Features）
 
 - **双通道事务发件箱零丢单（Dual-Channel Transactional Outbox）**
-  `POST /v1/tasks` 在单次 PG 事务内原子写入 `tasks` 与 `outbox`。Relay 协程拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka）与**延迟通道**（`deliver_at > now()` 写延迟池，遇 Redis 故障独立退避不堵队头），配合 `FOR UPDATE SKIP LOCKED` 与单批 `5s` 硬超时推入后物理 `DELETE`，使 `outbox` 常驻行数趋近于 0。
+  `POST /v1/tasks` 在单次 PG 事务内原子写入 `tasks` 与 `outbox`。Relay 协程拆分为**立即通道**（`deliver_at <= now()` 直推 Kafka）与**延迟通道**（`deliver_at > now() AND deliver_at > created_at` 经原子批量 Lua 写延迟池，遇 Redis 故障独立退避不堵队头），配合 `FOR UPDATE SKIP LOCKED` 与单批 `5s` 硬超时推入后物理 `DELETE`，使 `outbox` 常驻行数趋近于 0。
 - **30 秒租约延迟池 + PG 游标对账自愈（Lease ZSet & Cursor Reconciler）**
-  Redis `ferry:delayed`（ZSet）仅存轻量 `task_id` 与目标毫秒时间戳 `score`。Forwarder 通过 Lua 续期 `30s` 调度租约推入 Kafka（固定按 `task_id` 分区），确认后**比对租约分数条件 `ZREM`** 防误删新调度；配合 `60s` PG Reconciler 游标循环扫描超期任务并以 `ZADD NX` 回灌延迟池，即使执行 `redis-cli FLUSHALL` 清空内存也可无损自愈。
+  Redis `ferry:delayed`（ZSet）仅存轻量 `task_id` 与目标毫秒时间戳 `score`，配合 `ferry:delayed:lease`（Hash）记录转发租约、`ferry:delayed:cancelled:<id>` 拦截取消后的迟写。Forwarder 在单轮 `<= min(5s, LeaseTTL/2)` 超时内通过 Lua 续期 `30s` 调度租约并推入 Kafka（固定按 `task_id` 分区），确认后**校验租约簿与分数一致再条件 `HDEL + ZREM`** 防误删新调度；配合 `60s` PG Reconciler 游标循环扫描超期任务并以 `ZADD NX` 回灌延迟池，即使执行 `redis-cli FLUSHALL` 清空内存也可无损自愈。
 - **Endpoint 级三维流控与虚拟排号防空转（3D Flow Control & Virtual Pacing）**
   Worker 投递前执行单次 Redis Lua 脚本 `admit_endpoint.lua`（统一采用 Redis `TIME`），原子完成 **连续失败自动熔断（含 `HALF_OPEN` 试探过期保护） -> QPS 令牌桶 -> 带过期时间戳的 ZSet 并发槽位**，并通过对称的 `CompleteDelivery` 归还槽位及更新熔断/`429` 冷却。受限或熔断任务按 `1/QPS` 虚拟排号游标分时顺延回退 `ferry:delayed`（不扣减重试次数，受 `deadline_at` 硬边界截断），杜绝大积压空转风暴。
 - **全链路三层幂等与原始字节签名（Three-Layer Idempotency & Raw-Byte Signing）**
@@ -58,9 +58,9 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
                                      |
               +----------------------+----------------------+
               | Outbox Relay 双通道 (SKIP LOCKED LIMIT 100 + 5s 超时)
-              v (deliver_at <= now)                         v (deliver_at > now)
-  [ Kafka: ferry.tasks.ready ] <====(100ms Lua 30s租约)==== [ Redis ZSet: ferry:delayed ]
-              |                    推Kafka确认后比对分数ZREM         ^           ^
+              v (deliver_at <= now)                         v (deliver_at > now && > created_at)
+  [ Kafka: ferry.tasks.ready ] <====(100ms Lua 30s租约)==== [ Redis: ferry:delayed + lease ]
+              |                    推Kafka确认后校验租约HDEL+ZREM    ^           ^
               v                                                   |           |
   [ ferry-worker ]                                                | 虚拟排号   | 指数退避/429
     1. Redis 执行互斥锁 + 早到校验 + 复合乐观锁守卫 + deadline 截断  | 顺延回退   |
@@ -88,7 +88,7 @@ Ferry 是一个基于 **Go + PostgreSQL + Kafka + Redis** 构建的高可靠异�
 
 ## 仓库结构与本地开发（Repository Layout & Development）
 
-当前仓库已落地 Milestone 1 立即投递主链路与工程规范结构（后续 M2 ~ M4 规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
+当前仓库已落地 Milestone 1 立即投递主链路与 Milestone 2 定时投递、双通道 Outbox 及 Redis 延迟池租约转发切片（后续规划见 [`docs/specs/roadmap.md`](./docs/specs/roadmap.md)）：
 
 ```text
 Ferry/
@@ -104,14 +104,14 @@ Ferry/
 ├── Makefile                     # 开发、校验、容器编排与验收入口 (setup-hooks / fmt / fmt-check / check-adr / check-scripts / lint / test / test-integration / up / down / migrate / verify-m1 / build)
 ├── go.mod                       # Go 1.27 模块定义
 ├── cmd/
-│   ├── ferry-server/            # 组装根：API 网关与 OutboxRelay
-│   ├── ferry-worker/            # 组装根：Kafka 消费、Execution Lock 与 HMAC 签名投递
+│   ├── ferry-server/            # 组装根：API 网关、双通道 OutboxRelay 与 DelayedForwarder
+│   ├── ferry-worker/            # 组装根：Kafka 消费、Execution Lock、延迟池保底回写与 HMAC 签名投递
 │   ├── chaos-receiver/          # 本地验证用下游接收靶场（验签、计数、指定状态码与延迟）
 │   └── ferry-bench/             # 并发压测 CLI 占位入口（Milestone 3）
 ├── internal/
 │   ├── domain/                  # 纯 Go 领域核（Endpoint / Task / DeliveryAttempt / 签名与状态机）
 │   ├── api/                     # 入站 HTTP 控制面深模块
-│   ├── scheduler/               # OutboxRelay 发件箱搬运深模块
+│   ├── scheduler/               # 双通道 OutboxRelay 与 DelayedForwarder 延迟池租约转发深模块
 │   ├── worker/                  # Step A~E 投递执行与优雅停机深模块
 │   ├── infra/                   # PG / Redis / Kafka / HTTP 出站适配器及真容器测试
 │   └── config/, logger/, metrics/

@@ -37,7 +37,7 @@
 2. **持久化五态模型（局部修正 ADR-0005）**：
    - 取消热路径投递前向 PG 写入 `UPDATE status = 'RUNNING'`，将 PG `tasks.status` 持久化状态严格收敛为 **`PENDING`、`RETRYING`、`SUCCEEDED`、`DEAD_LETTER`、`CANCELLED` 五个状态**；
    - **工程依据**：① 避免每笔投递使 `tasks` 表写放大与 MVCC 死元组翻倍；② 防止 Worker 在 HTTP 期间遭遇 `kill -9` 且 Kafka 消息未重投时，停留在 `RUNNING` 的行脱离 `tasks_reconcile_idx`（仅索引 `PENDING, RETRYING`）成为永久孤儿；
-   - **在途状态与取消真互斥**：任务“是否正在执行中”由 `Execution Lock` 唯一表达；`POST /v1/tasks/{id}/cancel` 自身先通过 `SET NX` 抢占 `Execution Lock`（抢锁失败说明在途执行中，直接返回 `409 Conflict`），持锁后再以 PG CAS `WHERE id = $1 AND status IN ('PENDING', 'RETRYING')` 迁移至 `CANCELLED` 并释放锁。Worker 侧更新统一携带 `(replay_count, attempt)` 复合乐观版本守卫；若极端锁超时下取消与在途请求重叠，Worker 结算事务的 CAS 未命中（返回 `applied = false`）不覆盖终态，但**依然同事务追加写入该次已实际发出的 `DeliveryAttempt` 审计行**。
+   - **在途状态与取消真互斥**：任务“是否正在执行中”由 `Execution Lock` 唯一表达；`POST /v1/tasks/{id}/cancel` 自身先通过 `SET NX` 抢占 `Execution Lock`（抢锁失败说明在途执行中，直接返回 `409 Conflict`），持锁后在单事务内以 PG CAS `WHERE id = $1 AND status IN ('PENDING', 'RETRYING')` 迁移至 `CANCELLED` 并清理未派发 `outbox`，提交后原子清理延迟池并写入取消标记再释放锁（详见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）。Worker 侧更新统一携带 `(replay_count, attempt)` 复合乐观版本守卫；若极端锁超时下取消与在途请求重叠，Worker 结算事务的 CAS 未命中（返回 `applied = false`）不覆盖终态，但**依然同事务追加写入该次已实际发出的 `DeliveryAttempt` 审计行**。
 3. **`Endpoint` 禁用不变量**：
    - `Endpoint.enabled == false` 时，入口同步拦截新任务创建；已入队的存量任务在到期进入 Worker 校验时直接迁移至 `DEAD_LETTER`（记 `last_error = 'ENDPOINT_DISABLED'`，不发 HTTP、不产生 `DeliveryAttempt`），避免反复穿透调度环路，待 `Endpoint` 重新启用后统一经 `POST /v1/dlq/replay` 按流控节奏平滑重放。
 

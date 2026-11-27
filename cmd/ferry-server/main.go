@@ -25,14 +25,17 @@ import (
 )
 
 var (
-	_ api.EndpointStore        = (*pg.Store)(nil)
-	_ api.TaskStore            = (*pg.Store)(nil)
-	_ api.ExecutionLocker      = (*redis.Client)(nil)
-	_ api.ReadinessProbe       = (*pg.Store)(nil)
-	_ api.ReadinessProbe       = (*kafka.ReadyProducer)(nil)
-	_ api.ReadinessProbe       = (*redis.Client)(nil)
-	_ scheduler.OutboxStore    = (*pg.Store)(nil)
-	_ scheduler.ReadyPublisher = (*kafka.ReadyProducer)(nil)
+	_ api.EndpointStore         = (*pg.Store)(nil)
+	_ api.TaskStore             = (*pg.Store)(nil)
+	_ api.ExecutionLocker       = (*redis.Client)(nil)
+	_ api.DelayedCanceller      = (*redis.Client)(nil)
+	_ api.ReadinessProbe        = (*pg.Store)(nil)
+	_ api.ReadinessProbe        = (*kafka.ReadyProducer)(nil)
+	_ api.ReadinessProbe        = (*redis.Client)(nil)
+	_ scheduler.OutboxStore     = (*pg.Store)(nil)
+	_ scheduler.ReadyPublisher  = (*kafka.ReadyProducer)(nil)
+	_ scheduler.DelayedEnqueuer = (*redis.Client)(nil)
+	_ scheduler.DelayedQueue    = (*redis.Client)(nil)
 )
 
 func main() {
@@ -113,6 +116,7 @@ func run(migrateOnly bool) error {
 		pgStore,
 		pgStore,
 		redisClient,
+		redisClient,
 		[]api.ReadinessProbe{pgStore, producer, redisClient},
 		api.HandlerConfig{
 			DefaultMaxAttempts: cfg.DefaultMaxAttempts,
@@ -128,10 +132,27 @@ func run(migrateOnly bool) error {
 		log,
 		pgStore,
 		producer,
+		redisClient,
 		scheduler.OutboxRelayConfig{
-			BatchSize:    cfg.OutboxBatchSize,
-			PollInterval: cfg.OutboxPollInterval,
-			BatchTimeout: cfg.OutboxBatchTimeout,
+			BatchSize:       cfg.OutboxBatchSize,
+			PollInterval:    cfg.OutboxPollInterval,
+			BatchTimeout:    cfg.OutboxBatchTimeout,
+			ErrorBackoffCap: cfg.SchedulerErrorBackoffCap,
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	forwarder, err := scheduler.NewDelayedForwarder(
+		log,
+		redisClient,
+		producer,
+		scheduler.DelayedForwarderConfig{
+			BatchSize:       cfg.DelayedBatchSize,
+			PollInterval:    cfg.DelayedPollInterval,
+			LeaseTTL:        cfg.DelayedLeaseTTL,
+			ErrorBackoffCap: cfg.SchedulerErrorBackoffCap,
 		},
 	)
 	if err != nil {
@@ -172,6 +193,10 @@ func run(migrateOnly bool) error {
 
 	g.Go(func() error {
 		return relay.Run(groupCtx)
+	})
+
+	g.Go(func() error {
+		return forwarder.Run(groupCtx)
 	})
 
 	g.Go(func() error {

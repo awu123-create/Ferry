@@ -180,6 +180,34 @@ func (l *fakeLocker) ReleaseExecutionLock(_ context.Context, taskID uuid.UUID, t
 	return nil
 }
 
+func (l *fakeLocker) isHeld(taskID uuid.UUID) bool {
+	_, ok := l.held[taskID]
+	return ok
+}
+
+type cancelledDelayedCall struct {
+	taskID       uuid.UUID
+	tombstoneTTL time.Duration
+}
+
+type fakeDelayedCanceller struct {
+	cancelled      []cancelledDelayedCall
+	cancelErr      error
+	lockHeldOnCall bool
+	checkLockHeld  func(uuid.UUID) bool
+}
+
+func (c *fakeDelayedCanceller) CancelDelayed(_ context.Context, taskID uuid.UUID, tombstoneTTL time.Duration) error {
+	if c.checkLockHeld != nil {
+		c.lockHeldOnCall = c.checkLockHeld(taskID)
+	}
+	c.cancelled = append(c.cancelled, cancelledDelayedCall{
+		taskID:       taskID,
+		tombstoneTTL: tombstoneTTL,
+	})
+	return c.cancelErr
+}
+
 type fakeProbe struct {
 	err error
 }
@@ -191,7 +219,7 @@ func (p fakeProbe) Ping(_ context.Context) error {
 func TestHandler_EndpointsLifecycleAndSecretRedaction(t *testing.T) {
 	ctx := t.Context()
 	store := &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}
-	h, err := api.NewHandler(zap.NewNop(), store, newFakeTaskStore(), newFakeLocker(), []api.ReadinessProbe{fakeProbe{}}, api.HandlerConfig{})
+	h, err := api.NewHandler(zap.NewNop(), store, newFakeTaskStore(), newFakeLocker(), &fakeDelayedCanceller{}, []api.ReadinessProbe{fakeProbe{}}, api.HandlerConfig{})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}
@@ -264,7 +292,7 @@ func TestHandler_ReadinessAndTaskCreateIdempotency(t *testing.T) {
 	}
 	epStore.items[ep.ID] = ep
 
-	h, err := api.NewHandler(zap.NewNop(), epStore, taskStore, locker, []api.ReadinessProbe{fakeProbe{err: errors.New("db down")}}, api.HandlerConfig{
+	h, err := api.NewHandler(zap.NewNop(), epStore, taskStore, locker, &fakeDelayedCanceller{}, []api.ReadinessProbe{fakeProbe{err: errors.New("db down")}}, api.HandlerConfig{
 		Clock: func() time.Time { return fixedNow },
 	})
 	if err != nil {
@@ -354,15 +382,54 @@ func TestHandler_ReadinessAndTaskCreateIdempotency(t *testing.T) {
 		t.Fatalf("expected 400 for invalid header name, got %d: %s", badHdrRec.Code, badHdrRec.Body.String())
 	}
 
-	// 未来 deliver_at 在 Milestone 1 应返回 400 Bad Request。
+	// 未来 30 天内的 deliver_at 返回 202 Accepted；相同 Idempotency-Key 变更 deliver_at 仍按载荷摘要与 Headers 幂等返回 200 OK。
 	future := fixedNow.Add(time.Hour).Format(time.RFC3339)
 	futureBody := []byte(`{"endpoint_id":"` + ep.ID.String() + `","payload":{"ok":1},"deliver_at":"` + future + `"}`)
 	futureReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks", bytes.NewReader(futureBody))
 	futureReq.Header.Set("Idempotency-Key", "k-future")
 	futureRec := httptest.NewRecorder()
 	h.ServeHTTP(futureRec, futureReq)
-	if futureRec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400 for future deliver_at, got %d: %s", futureRec.Code, futureRec.Body.String())
+	if futureRec.Code != http.StatusAccepted {
+		t.Fatalf("expected 202 for future deliver_at within 30 days, got %d: %s", futureRec.Code, futureRec.Body.String())
+	}
+	var futureCreated taskResp
+	if err := json.Unmarshal(futureRec.Body.Bytes(), &futureCreated); err != nil {
+		t.Fatalf("decode future task response: %v", err)
+	}
+
+	retryFuture := fixedNow.Add(2 * time.Hour).Format(time.RFC3339)
+	retryFutureBody := []byte(`{"endpoint_id":"` + ep.ID.String() + `","payload":{"ok":1},"deliver_at":"` + retryFuture + `"}`)
+	retryFutureReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks", bytes.NewReader(retryFutureBody))
+	retryFutureReq.Header.Set("Idempotency-Key", "k-future")
+	retryFutureRec := httptest.NewRecorder()
+	h.ServeHTTP(retryFutureRec, retryFutureReq)
+	if retryFutureRec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK on idempotent retry with different deliver_at, got %d: %s", retryFutureRec.Code, retryFutureRec.Body.String())
+	}
+	var retryFutureTask taskResp
+	if err := json.Unmarshal(retryFutureRec.Body.Bytes(), &retryFutureTask); err != nil {
+		t.Fatalf("decode idempotent retry future task: %v", err)
+	}
+	if retryFutureTask.ID != futureCreated.ID {
+		t.Fatalf("expected same task id %s on idempotent retry, got %s", futureCreated.ID, retryFutureTask.ID)
+	}
+
+	// 超过当前时间 +30 天的 deliver_at 返回 400 VALIDATION_ERROR。
+	tooFar := fixedNow.Add(30*24*time.Hour + time.Minute).Format(time.RFC3339)
+	tooFarBody := []byte(`{"endpoint_id":"` + ep.ID.String() + `","payload":{"ok":1},"deliver_at":"` + tooFar + `"}`)
+	tooFarReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks", bytes.NewReader(tooFarBody))
+	tooFarReq.Header.Set("Idempotency-Key", "k-too-far")
+	tooFarRec := httptest.NewRecorder()
+	h.ServeHTTP(tooFarRec, tooFarReq)
+	if tooFarRec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for deliver_at beyond 30 days, got %d: %s", tooFarRec.Code, tooFarRec.Body.String())
+	}
+	var tooFarErr errorEnvelope
+	if err := json.Unmarshal(tooFarRec.Body.Bytes(), &tooFarErr); err != nil {
+		t.Fatalf("decode too-far error envelope: %v", err)
+	}
+	if tooFarErr.Error.Code != "VALIDATION_ERROR" {
+		t.Fatalf("expected VALIDATION_ERROR, got %+v", tooFarErr)
 	}
 }
 
@@ -371,8 +438,10 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 	epStore := &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}
 	taskStore := newFakeTaskStore()
 	locker := newFakeLocker()
+	delayed := &fakeDelayedCanceller{checkLockHeld: locker.isHeld}
 
 	now := time.Date(2026, 11, 22, 9, 0, 0, 0, time.UTC)
+	currentNow := now
 	ep, err := domain.NewEndpoint(domain.NewEndpointParams{
 		Name:      "orders",
 		TargetURL: "http://localhost:8081/webhook",
@@ -382,12 +451,14 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 	}
 	epStore.items[ep.ID] = ep
 
+	futureDeliver := now.Add(2 * time.Hour)
 	task, err := domain.NewTask(domain.NewTaskParams{
 		Endpoint:       ep,
 		IdempotencyKey: "cancel-1",
 		RawPayload:     []byte(`{"k":1}`),
+		DeliverAt:      &futureDeliver,
 		MaxAttempts:    1,
-		DefaultWindow:  time.Hour,
+		DefaultWindow:  24 * time.Hour,
 		Now:            now,
 	})
 	if err != nil {
@@ -397,14 +468,14 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 		t.Fatalf("CreateTaskIdempotent failed: %v", err)
 	}
 
-	h, err := api.NewHandler(zap.NewNop(), epStore, taskStore, locker, nil, api.HandlerConfig{
-		Clock: func() time.Time { return now },
+	h, err := api.NewHandler(zap.NewNop(), epStore, taskStore, locker, delayed, nil, api.HandlerConfig{
+		Clock: func() time.Time { return currentNow },
 	})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}
 
-	// 模拟 Worker 正在持锁执行：Cancel 必须返回 409 Conflict 且不改任务状态。
+	// 模拟 Worker 正在持锁执行：Cancel 必须返回 409 Conflict 且不改任务状态，也不清理延迟池。
 	locker.held[task.ID] = "worker-token"
 	inFlightReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks/"+task.ID.String()+"/cancel", nil)
 	inFlightRec := httptest.NewRecorder()
@@ -412,11 +483,11 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 	if inFlightRec.Code != http.StatusConflict {
 		t.Fatalf("expected 409 when execution lock is held, got %d: %s", inFlightRec.Code, inFlightRec.Body.String())
 	}
-	if taskStore.byID[task.ID].Status != domain.TaskStatusPending {
-		t.Fatalf("expected task status still PENDING, got %s", taskStore.byID[task.ID].Status)
+	if taskStore.byID[task.ID].Status != domain.TaskStatusPending || len(delayed.cancelled) != 0 {
+		t.Fatalf("expected task untouched and delayed not cancelled, status=%s cancelled=%+v", taskStore.byID[task.ID].Status, delayed.cancelled)
 	}
 
-	// 释放锁后可成功取消，并在完成后释放执行锁且上下文携带 task_id。
+	// 释放锁后可成功取消：持锁期间调 CancelDelayed，固定写入 10m 取消标记（不随 DeadlineAt 拉长）。
 	delete(locker.held, task.ID)
 	cancelReq := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks/"+task.ID.String()+"/cancel", nil)
 	cancelRec := httptest.NewRecorder()
@@ -430,8 +501,89 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 	if !taskStore.lastCtxHasTask || taskStore.lastCtxTaskID != task.ID {
 		t.Fatalf("expected task_id bound to cancel ctx, has=%v got=%s", taskStore.lastCtxHasTask, taskStore.lastCtxTaskID)
 	}
+	const wantTombstoneTTL = 10 * time.Minute
+	if len(delayed.cancelled) != 1 || delayed.cancelled[0].taskID != task.ID || delayed.cancelled[0].tombstoneTTL != wantTombstoneTTL || !delayed.lockHeldOnCall {
+		t.Fatalf("expected CancelDelayed(%s, %v) while holding lock, got cancelled=%+v lockHeld=%v", task.ID, wantTombstoneTTL, delayed.cancelled, delayed.lockHeldOnCall)
+	}
 	if locker.releaseCount != 1 || len(locker.held) != 0 {
 		t.Fatalf("expected lock released once, releaseCount=%d held=%d", locker.releaseCount, len(locker.held))
+	}
+
+	// 已过 DeadlineAt 或极远 DeadlineAt 的任务取消时，均统一使用固定 10m 取消标记，不因远期截止时间在 Redis 长期驻留或溢出。
+	extremeDeadline := time.Date(9999, 12, 31, 23, 59, 59, 0, time.UTC)
+	deadlineCases := []struct {
+		name       string
+		key        string
+		nowAt      time.Time
+		deadlineAt *time.Time
+		window     time.Duration
+	}{
+		{
+			name:   "past_deadline",
+			key:    "cancel-near-deadline",
+			nowAt:  now.Add(20 * time.Minute),
+			window: 10 * time.Minute,
+		},
+		{
+			name:       "extreme_deadline",
+			key:        "cancel-extreme-deadline",
+			nowAt:      now,
+			deadlineAt: &extremeDeadline,
+			window:     time.Hour,
+		},
+	}
+	for _, tc := range deadlineCases {
+		t.Run(tc.name, func(t *testing.T) {
+			targetTask, err := domain.NewTask(domain.NewTaskParams{
+				Endpoint:       ep,
+				IdempotencyKey: tc.key,
+				RawPayload:     []byte(`{"k":"` + tc.name + `"}`),
+				MaxAttempts:    1,
+				DeadlineAt:     tc.deadlineAt,
+				DefaultWindow:  tc.window,
+				Now:            now,
+			})
+			if err != nil {
+				t.Fatalf("NewTask(%s) failed: %v", tc.name, err)
+			}
+			if _, err := taskStore.CreateTaskIdempotent(ctx, targetTask); err != nil {
+				t.Fatalf("CreateTaskIdempotent(%s) failed: %v", tc.name, err)
+			}
+			currentNow = tc.nowAt
+			req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks/"+targetTask.ID.String()+"/cancel", nil)
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200 OK cancelling %s task, got %d: %s", tc.name, rec.Code, rec.Body.String())
+			}
+			if got := delayed.cancelled[len(delayed.cancelled)-1]; got.taskID != targetTask.ID || got.tombstoneTTL != wantTombstoneTTL {
+				t.Fatalf("expected fixed 10m tombstone TTL for %s task, got %+v", tc.name, got)
+			}
+		})
+	}
+
+	// 延迟池清理失败仅记告警日志，不得回滚或报错覆盖取消成功结果。
+	currentNow = now
+	task2, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: "cancel-2",
+		RawPayload:     []byte(`{"k":2}`),
+		MaxAttempts:    1,
+		DefaultWindow:  time.Hour,
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("NewTask 2 failed: %v", err)
+	}
+	if _, err := taskStore.CreateTaskIdempotent(ctx, task2); err != nil {
+		t.Fatalf("CreateTaskIdempotent 2 failed: %v", err)
+	}
+	delayed.cancelErr = errors.New("redis down")
+	cancel2Req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/tasks/"+task2.ID.String()+"/cancel", nil)
+	cancel2Rec := httptest.NewRecorder()
+	h.ServeHTTP(cancel2Rec, cancel2Req)
+	if cancel2Rec.Code != http.StatusOK || taskStore.byID[task2.ID].Status != domain.TaskStatusCancelled {
+		t.Fatalf("expected cancel still 200 CANCELLED when delayed cleanup fails, code=%d status=%s", cancel2Rec.Code, taskStore.byID[task2.ID].Status)
 	}
 
 	// 重复取消已终态任务返回 409 Conflict。
@@ -450,7 +602,7 @@ func TestHandler_SanitizesWrappedErrors(t *testing.T) {
 	t.Run("wrapped_sentinel_sanitized", func(t *testing.T) {
 		taskStore := newFakeTaskStore()
 		taskStore.cancelErr = fmt.Errorf("cancel task 123: concurrent state transition (status=PENDING): %w", domain.ErrTaskNotCancellable)
-		h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, taskStore, newFakeLocker(), nil, api.HandlerConfig{})
+		h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, taskStore, newFakeLocker(), &fakeDelayedCanceller{}, nil, api.HandlerConfig{})
 		if err != nil {
 			t.Fatalf("NewHandler failed: %v", err)
 		}
@@ -478,7 +630,7 @@ func TestHandler_SanitizesWrappedErrors(t *testing.T) {
 		valErr := domain.NewValidationError("payload", "must be valid JSON")
 		taskStore := newFakeTaskStore()
 		taskStore.cancelErr = fmt.Errorf("internal decode wrapper: %w", valErr)
-		h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, taskStore, newFakeLocker(), nil, api.HandlerConfig{})
+		h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, taskStore, newFakeLocker(), &fakeDelayedCanceller{}, nil, api.HandlerConfig{})
 		if err != nil {
 			t.Fatalf("NewHandler failed: %v", err)
 		}
@@ -502,7 +654,7 @@ func TestHandler_SanitizesWrappedErrors(t *testing.T) {
 	t.Run("non_domain_internal_500", func(t *testing.T) {
 		taskStore := newFakeTaskStore()
 		taskStore.cancelErr = fmt.Errorf("execution lock ttl must be > 0")
-		h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, taskStore, newFakeLocker(), nil, api.HandlerConfig{})
+		h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, taskStore, newFakeLocker(), &fakeDelayedCanceller{}, nil, api.HandlerConfig{})
 		if err != nil {
 			t.Fatalf("NewHandler failed: %v", err)
 		}
@@ -526,7 +678,7 @@ func TestHandler_SanitizesWrappedErrors(t *testing.T) {
 
 func TestHandler_DecodeJSONBodyRejectsTrailingAndDuplicateKeys(t *testing.T) {
 	ctx := t.Context()
-	h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, newFakeTaskStore(), newFakeLocker(), nil, api.HandlerConfig{})
+	h, err := api.NewHandler(zap.NewNop(), &fakeEndpointStore{items: make(map[uuid.UUID]domain.Endpoint)}, newFakeTaskStore(), newFakeLocker(), &fakeDelayedCanceller{}, nil, api.HandlerConfig{})
 	if err != nil {
 		t.Fatalf("NewHandler failed: %v", err)
 	}

@@ -14,7 +14,11 @@ import (
 	"github.com/awu123-create/ferry/internal/logger"
 )
 
-const taskEnvelopeOverheadBytes = 64 << 10
+const (
+	taskEnvelopeOverheadBytes = 64 << 10
+	cancelCleanupTimeout      = 5 * time.Second
+	cancelTombstoneTTL        = 10 * time.Minute
+)
 
 type createTaskRequest struct {
 	EndpointID     string            `json:"endpoint_id"`
@@ -255,7 +259,8 @@ func (h *Handler) createTask(ctx context.Context, input createTaskInput) (domain
 	return h.tasks.CreateTaskIdempotent(ctx, task)
 }
 
-// cancelTask 先抢占 Execution Lock，再在 PostgreSQL 中原子取消处于非终态的 Task（ADR-0008 §3）。
+// cancelTask 先抢占 Execution Lock，在 PostgreSQL 中原子取消非终态 Task 后顺带清理延迟池成员
+// （详见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (h *Handler) cancelTask(ctx context.Context, taskID uuid.UUID) (domain.Task, error) {
 	token, acquired, err := h.locker.AcquireExecutionLock(ctx, taskID, h.cfg.CancelLockTTL)
 	if err != nil {
@@ -265,7 +270,7 @@ func (h *Handler) cancelTask(ctx context.Context, taskID uuid.UUID) (domain.Task
 		return domain.Task{}, domain.ErrTaskExecutionInFlight
 	}
 	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cancelCleanupTimeout)
 		defer cancel()
 		if relErr := h.locker.ReleaseExecutionLock(releaseCtx, taskID, token); relErr != nil {
 			h.log.Warn(
@@ -276,5 +281,20 @@ func (h *Handler) cancelTask(ctx context.Context, taskID uuid.UUID) (domain.Task
 		}
 	}()
 
-	return h.tasks.CancelTask(ctx, taskID, h.now())
+	now := h.now()
+	task, err := h.tasks.CancelTask(ctx, taskID, now)
+	if err != nil {
+		return domain.Task{}, err
+	}
+
+	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), cancelCleanupTimeout)
+	defer cancelCleanup()
+	if rmErr := h.delayed.CancelDelayed(cleanupCtx, taskID, cancelTombstoneTTL); rmErr != nil {
+		h.log.Warn(
+			"cancel delayed task cleanup failed",
+			zap.String("task_id", taskID.String()),
+			zap.Error(rmErr),
+		)
+	}
+	return task, nil
 }

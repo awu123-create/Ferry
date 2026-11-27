@@ -1,6 +1,6 @@
 # ADR-0004: Endpoint 级三维流控隔离与全链路三层幂等机制
 
-- **状态**：已采纳（部分细则已由 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：顺延改为按 `1/QPS` 虚拟排号摊平、半开试探加超时、`deadline_at` 改为首次触发时间起算、补齐执行锁四步协议与复合乐观版本 CAS）
+- **状态**：已采纳（部分细则已由 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 修订：顺延改为按 `1/QPS` 虚拟排号摊平、半开试探加超时、`deadline_at` 改为 `max(next_run_at, now) + default_ttl` 起算、补齐执行锁四步协议与复合乐观版本 CAS）
 - **日期**：2026-11-16
 
 ## 背景与问题（Context）
@@ -41,7 +41,7 @@ Worker 在从 PG 读取任务详情并通过状态守卫后，向 Redis 提交�
    - 每次准入前先执行 `ZREMRANGEBYSCORE ferry:inflight:<ep_id> -inf <now_ms>` 自动清理因进程崩溃遗留的过期僵死槽位，再校验 `ZCARD < endpoint.max_concurrency`；
    - 投递结束通过 `CompleteDelivery` 主动释放；即便 Worker 进程被 `kill -9` 强杀，槽位也最晚在 `timeout_ms + 5s` 后自动失效释放，彻底杜绝并发死锁。
 4. **有界循环兜底（`deadline_at` 硬边界）**：
-   - 为防止持续限流或永久熔断导致任务在 `Kafka <-> ZSet` 之间无限循环空转，每条任务在创建或重放时均记录 `deadline_at`（初版曾按 `created_at + 24h` 计算，现行起算基准改为首次 `next_run_at + default_ttl`，见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）；
+   - 为防止持续限流或永久熔断导致任务在 `Kafka <-> ZSet` 之间无限循环空转，每条任务在创建或重放时均记录 `deadline_at`（初版曾按 `created_at + 24h` 计算，现行起算基准改为 `max(next_run_at, now) + default_ttl`，见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）；
    - Worker 判定当前时间或下次排期已超过 `deadline_at` 时直接终止流转，通过复合乐观锁落入终态 `DEAD_LETTER`（标记 `TTL_EXPIRED`）。
 
 ### 二、全链路三层幂等契约
@@ -51,7 +51,7 @@ Worker 在从 PG 读取任务详情并通过状态守卫后，向 Redis 提交�
    - 同键同载荷（比对 `payload_sha256`）重复调用 `POST /v1/tasks` 时返回 `200 OK` 与原始 `task_id`；同键不同载荷返回 `409 Conflict` 拒绝静默覆盖。
 2. **Worker 并发与重放幂等（防 Kafka 重平衡或 Relay 重复推）**：
    - Worker 在发起 HTTP 请求前先抢占 Redis 执行锁 `ferry:lock:task:<task_id>` 并核对 PG `tasks` 状态，若已终态直接确认 Kafka Offset；
-   - _演进说明_：初版曾拟定抢锁失败直接跳过确认、并使用无版本号的 `status NOT IN (...)` 条件更新；现行执行锁四步协议（含提交后验主删锁、争用时 `ZADD NX` 保底顺延、`Cancel` 主动抢锁互斥）及 `(replay_count, attempt)` 复合乐观版本 CAS 守卫统一以 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 为准。
+   - _演进说明_：初版曾拟定抢锁失败直接跳过确认、并使用无版本号的 `status NOT IN (...)` 条件更新；现行执行锁四步协议（含提交/回写后由内层单 `defer` 先释放锁再由外层确认 `Ack`、放锁瞬时失败记 `Warn` 交由短锁 TTL 过期防卡分区水位、争用时先查 PG 终态再经取消标记校验与临时租约替换写回延迟池、`Cancel` 主动抢锁互斥并同事务清理 `outbox` 与写入固定 `10m` Redis 取消标记）及 `(replay_count, attempt)` 复合乐观版本 CAS 守卫统一以 [ADR-0007](./0007-tactical-ddd-and-deep-module-seams.md) 与 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md) 为准。
 3. **下游幂等契约（防“下游已处理成功但 200 响应丢包”）**：
    - 遵循分布式传输“至少一次”客观规律，每次重试固定携带同一个 `X-Ferry-Task-ID: <task_id>` 请求头，供下游接收服务基于该 ID 做业务幂等去重，同时结合 `X-Ferry-Signature` 防止恶意伪造重放。
 

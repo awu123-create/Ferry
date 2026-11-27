@@ -34,6 +34,52 @@ func TestLoadServerConfig_Defaults(t *testing.T) {
 	if cfg.OutboxBatchSize != 100 || cfg.OutboxPollInterval != 500*time.Millisecond || cfg.OutboxBatchTimeout != 5*time.Second {
 		t.Fatalf("unexpected outbox defaults: %+v", cfg)
 	}
+	if cfg.DelayedPollInterval != 100*time.Millisecond || cfg.DelayedBatchSize != 100 || cfg.DelayedLeaseTTL != 30*time.Second {
+		t.Fatalf("unexpected delayed forwarder defaults: %+v", cfg)
+	}
+	if cfg.SchedulerErrorBackoffCap != 5*time.Second {
+		t.Fatalf("expected SchedulerErrorBackoffCap = 5s, got %v", cfg.SchedulerErrorBackoffCap)
+	}
+}
+
+func TestLoadServerConfig_DelayedOverridesAndValidationErrors(t *testing.T) {
+	t.Run("valid_overrides", func(t *testing.T) {
+		t.Setenv("FERRY_DELAYED_POLL_INTERVAL", "50ms")
+		t.Setenv("FERRY_DELAYED_BATCH_SIZE", "250")
+		t.Setenv("FERRY_DELAYED_LEASE_TTL", "15s")
+		t.Setenv("FERRY_SCHEDULER_ERROR_BACKOFF_CAP", "3s")
+
+		cfg, err := config.LoadServerConfig()
+		if err != nil {
+			t.Fatalf("LoadServerConfig returned unexpected error: %v", err)
+		}
+		if cfg.DelayedPollInterval != 50*time.Millisecond ||
+			cfg.DelayedBatchSize != 250 ||
+			cfg.DelayedLeaseTTL != 15*time.Second ||
+			cfg.SchedulerErrorBackoffCap != 3*time.Second {
+			t.Fatalf("unexpected delayed config overrides: %+v", cfg)
+		}
+	})
+
+	invalidCases := []struct {
+		name string
+		env  string
+		val  string
+	}{
+		{name: "zero_delayed_poll_interval", env: "FERRY_DELAYED_POLL_INTERVAL", val: "0s"},
+		{name: "bad_delayed_poll_interval", env: "FERRY_DELAYED_POLL_INTERVAL", val: "oops"},
+		{name: "zero_delayed_batch_size", env: "FERRY_DELAYED_BATCH_SIZE", val: "0"},
+		{name: "negative_delayed_lease_ttl", env: "FERRY_DELAYED_LEASE_TTL", val: "-1s"},
+		{name: "zero_scheduler_backoff_cap", env: "FERRY_SCHEDULER_ERROR_BACKOFF_CAP", val: "0s"},
+	}
+	for _, tc := range invalidCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.env, tc.val)
+			if _, err := config.LoadServerConfig(); err == nil {
+				t.Fatalf("expected error for %s=%q", tc.env, tc.val)
+			}
+		})
+	}
 }
 
 func TestLoadServerConfig_ValidationErrors(t *testing.T) {
@@ -76,13 +122,33 @@ func TestLoadWorkerConfig_DefaultsAndOverrides(t *testing.T) {
 	if cfg.MaxResponseSnippetBytes != 1024 {
 		t.Fatalf("expected MaxResponseSnippetBytes=1024, got %d", cfg.MaxResponseSnippetBytes)
 	}
+	if cfg.ExecutionLockFallbackDelay != 5*time.Second {
+		t.Fatalf("expected default ExecutionLockFallbackDelay=5s, got %v", cfg.ExecutionLockFallbackDelay)
+	}
+
+	t.Setenv("FERRY_EXECUTION_LOCK_FALLBACK_DELAY", "2s")
+	overridden, err := config.LoadWorkerConfig()
+	if err != nil {
+		t.Fatalf("LoadWorkerConfig override returned unexpected error: %v", err)
+	}
+	if overridden.ExecutionLockFallbackDelay != 2*time.Second {
+		t.Fatalf("expected overridden ExecutionLockFallbackDelay=2s, got %v", overridden.ExecutionLockFallbackDelay)
+	}
 }
 
 func TestLoadWorkerConfig_ValidationErrors(t *testing.T) {
-	t.Setenv("FERRY_WORKER_CONCURRENCY", "0")
-	if _, err := config.LoadWorkerConfig(); err == nil {
-		t.Fatal("expected error for FERRY_WORKER_CONCURRENCY=0")
-	}
+	t.Run("zero_concurrency", func(t *testing.T) {
+		t.Setenv("FERRY_WORKER_CONCURRENCY", "0")
+		if _, err := config.LoadWorkerConfig(); err == nil {
+			t.Fatal("expected error for FERRY_WORKER_CONCURRENCY=0")
+		}
+	})
+	t.Run("zero_lock_fallback_delay", func(t *testing.T) {
+		t.Setenv("FERRY_EXECUTION_LOCK_FALLBACK_DELAY", "0s")
+		if _, err := config.LoadWorkerConfig(); err == nil {
+			t.Fatal("expected error for FERRY_EXECUTION_LOCK_FALLBACK_DELAY=0s")
+		}
+	})
 }
 
 func TestLoadReceiverConfig_OverridesAndValidation(t *testing.T) {

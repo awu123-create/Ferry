@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/awu123-create/ferry/internal/domain"
@@ -17,17 +18,19 @@ import (
 const (
 	// initialExecutionLockTTL 为 Step A 首次抢锁的短租约，仅覆盖读库与前置守卫；
 	// 读到 Endpoint 后再按 timeout_ms + LockGrace 做验主续期，避免短超时任务白占 75s 锁。
-	initialExecutionLockTTL = 15 * time.Second
-	lockReleaseTimeout      = 5 * time.Second
-	pollErrorBackoff        = 200 * time.Millisecond
-	periodicCommitPeriod    = 500 * time.Millisecond
-	finalCommitTimeout      = 5 * time.Second
+	initialExecutionLockTTL  = 15 * time.Second
+	defaultLockFallbackDelay = 5 * time.Second
+	lockReleaseTimeout       = 5 * time.Second
+	pollErrorBackoff         = 200 * time.Millisecond
+	periodicCommitPeriod     = 500 * time.Millisecond
+	finalCommitTimeout       = 5 * time.Second
 )
 
-// Config 配置 Worker 并发度、执行锁保护余量、优雅停机排空超时与时钟来源。
+// Config 配置 Worker 并发度、执行锁保护余量、抢锁争用兜底时长、优雅停机排空超时与时钟来源。
 type Config struct {
 	Concurrency          int
 	LockGrace            time.Duration
+	LockFallbackDelay    time.Duration
 	ShutdownDrainTimeout time.Duration
 	Clock                func() time.Time
 }
@@ -40,6 +43,7 @@ type Worker struct {
 	tasks     TaskStore
 	endpoints EndpointReader
 	locker    ExecutionLocker
+	delayed   DelayedScheduler
 	sender    HTTPSender
 	cfg       Config
 	ready     atomic.Bool
@@ -52,6 +56,7 @@ func NewWorker(
 	tasks TaskStore,
 	endpoints EndpointReader,
 	locker ExecutionLocker,
+	delayed DelayedScheduler,
 	sender HTTPSender,
 	cfg Config,
 ) (*Worker, error) {
@@ -67,6 +72,9 @@ func NewWorker(
 	if locker == nil {
 		return nil, fmt.Errorf("worker requires an ExecutionLocker")
 	}
+	if delayed == nil {
+		return nil, fmt.Errorf("worker requires a DelayedScheduler")
+	}
 	if sender == nil {
 		return nil, fmt.Errorf("worker requires an HTTPSender")
 	}
@@ -78,6 +86,9 @@ func NewWorker(
 	}
 	if cfg.LockGrace <= 0 {
 		cfg.LockGrace = 15 * time.Second
+	}
+	if cfg.LockFallbackDelay <= 0 {
+		cfg.LockFallbackDelay = defaultLockFallbackDelay
 	}
 	if cfg.ShutdownDrainTimeout <= 0 {
 		cfg.ShutdownDrainTimeout = 25 * time.Second
@@ -92,6 +103,7 @@ func NewWorker(
 		tasks:     tasks,
 		endpoints: endpoints,
 		locker:    locker,
+		delayed:   delayed,
 		sender:    sender,
 		cfg:       cfg,
 	}, nil
@@ -215,40 +227,65 @@ pollLoop:
 	return nil
 }
 
-// ProcessDelivery 对单条就绪任务句柄执行 Step A~E 全流程处理（ADR-0007 & ADR-0008）。
+// ProcessDelivery 对单条就绪任务句柄执行 Step A~E 全流程处理
+// （详见 docs/adr/0007-tactical-ddd-and-deep-module-seams.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDelivery) error {
 	ctx = logger.WithTaskID(ctx, delivery.TaskID)
 
 	// Step A：先以短租约抢占 Redis 执行互斥锁，确保后续读取到最新任务快照；
-	// 读取到 Endpoint 实际 timeout_ms 后再按 timeout_ms + LockGrace 做验主续期。
+	// 读取到 Endpoint 实际 timeout_ms 后再按 timeout_ms + LockGrace 续期。
 	token, acquired, err := w.locker.AcquireExecutionLock(ctx, delivery.TaskID, initialExecutionLockTTL)
 	if err != nil {
 		return fmt.Errorf("acquire execution lock: %w", err)
 	}
 	if !acquired {
-		// 另一个 Worker 或 Cancel API 正持有该任务锁；Milestone 2 会在此处补充 ZADD NX 保底写入 ferry:delayed 后再 Ack。
-		w.log.Debug("execution lock held by another owner; skipping duplicate delivery", zap.String("task_id", delivery.TaskID.String()))
+		// 别的 Worker 或取消接口正占着这把锁：先查一次 PG，如果任务不存在或已经结束就直接确认消费、零次写 Redis；
+		// 还在进行中才写回延迟池（Lua 脚本里会再检查取消标记，防止取消后的迟写污染延迟池）
+		// （见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
+		task, getErr := w.tasks.GetTask(ctx, delivery.TaskID)
+		if getErr != nil && !errors.Is(getErr, domain.ErrTaskNotFound) {
+			return fmt.Errorf("load contended task: %w", getErr)
+		}
+		if errors.Is(getErr, domain.ErrTaskNotFound) || task.Status.IsTerminal() {
+			ackDelivery(delivery)
+			return nil
+		}
+		if deferErr := w.delayed.DeferContendedTask(ctx, delivery.TaskID, w.cfg.LockFallbackDelay); deferErr != nil {
+			return fmt.Errorf("defer contended task: %w", deferErr)
+		}
+		w.log.Debug("execution lock held by another owner; deferred wake-up and acknowledged delivery", zap.String("task_id", delivery.TaskID.String()))
 		ackDelivery(delivery)
 		return nil
 	}
+
+	if err := w.runLockedDelivery(ctx, delivery.TaskID, token); err != nil {
+		return err
+	}
+	ackDelivery(delivery)
+	return nil
+}
+
+// runLockedDelivery 在已持有 Execution Lock 的前提下执行 Step B ~ Step E 全流程：
+// 利用 Go 返回前必先执行 defer 的特性，确保正常结束时先释放锁再回到外层确认 Kafka 消费；
+// 若业务已完成但收尾放锁偶发报错，只记 Warn 交由短锁 TTL 自然过期，不阻断外层 Ack，避免卡死 Kafka 分区提交水位
+// （见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
+func (w *Worker) runLockedDelivery(ctx context.Context, taskID uuid.UUID, token string) error {
 	defer func() {
-		// 必须在 PG 结算事务提交之后才通过 Lua 验主释放执行锁（ADR-0008 §3.1）。
 		releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), lockReleaseTimeout)
 		defer cancel()
-		if relErr := w.locker.ReleaseExecutionLock(releaseCtx, delivery.TaskID, token); relErr != nil {
+		if relErr := w.locker.ReleaseExecutionLock(releaseCtx, taskID, token); relErr != nil {
 			w.log.Warn(
-				"release execution lock failed",
-				zap.String("task_id", delivery.TaskID.String()),
+				"release execution lock failed; lock will expire by TTL",
+				zap.String("task_id", taskID.String()),
 				zap.Error(relErr),
 			)
 		}
 	}()
 
 	// Step B：加载 Task 与 Endpoint 并执行前置守卫检查。
-	task, err := w.tasks.GetTask(ctx, delivery.TaskID)
+	task, err := w.tasks.GetTask(ctx, taskID)
 	if errors.Is(err, domain.ErrTaskNotFound) {
-		w.log.Warn("task not found in postgres; acknowledging delivery", zap.String("task_id", delivery.TaskID.String()))
-		ackDelivery(delivery)
+		w.log.Warn("task not found in postgres; acknowledging delivery", zap.String("task_id", taskID.String()))
 		return nil
 	}
 	if err != nil {
@@ -265,7 +302,6 @@ func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDeliv
 			zap.String("task_id", task.ID.String()),
 			zap.String("endpoint_id", task.EndpointID.String()),
 		)
-		ackDelivery(delivery)
 		return nil
 	}
 	if err != nil {
@@ -277,27 +313,37 @@ func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDeliv
 	if err != nil {
 		return fmt.Errorf("evaluate pre-delivery guard: %w", err)
 	}
-	if decision.AlreadyFinal || decision.EarlyArrival {
-		// Milestone 2 在 EarlyArrival 时会先保底 ZADD 回延迟池再 Ack。
-		ackDelivery(delivery)
+	if decision.AlreadyFinal {
+		return nil
+	}
+	if decision.EarlyArrival {
+		// 任务还没到执行时间：先覆盖写回延迟池并清掉旧租约，返回后由外层依次释放 Execution Lock 并确认 Kafka 消费。
+		// 同时把剩余等待时长传给 Redis，让脚本按 Redis 自己的时钟至少延后这么久，避免两台机器时间不一致时任务刚放回去又立刻被捞出来。
+		if schedErr := w.delayed.ScheduleDelayed(ctx, task.ID, task.NextRunAt, task.NextRunAt.Sub(now)); schedErr != nil {
+			return fmt.Errorf("requeue early-arrival task: %w", schedErr)
+		}
+		w.log.Debug(
+			"task arrived before next_run_at; requeued to delayed pool",
+			zap.String("task_id", task.ID.String()),
+			zap.Time("next_run_at", task.NextRunAt),
+		)
 		return nil
 	}
 	if decision.DeadLetterCode != "" {
 		if _, err := w.tasks.SavePreDeliveryDeadLetter(ctx, task.ID, loadedReplay, loadedAttempt, decision.DeadLetterCode, now); err != nil {
 			return fmt.Errorf("save pre-delivery dead letter: %w", err)
 		}
-		ackDelivery(delivery)
 		return nil
 	}
 
-	// Step C（锁续期）：在发起出站 HTTP 请求前，按 Endpoint 实际超时与保护余量验主续期执行锁。
+	// Step C（锁续期）：在发起出站 HTTP 请求前，按 Endpoint 实际超时与保护余量核对归属后续期执行锁。
 	deliveryLockTTL := time.Duration(ep.TimeoutMs)*time.Millisecond + w.cfg.LockGrace
-	extended, err := w.locker.ExtendExecutionLock(ctx, delivery.TaskID, token, deliveryLockTTL)
+	extended, err := w.locker.ExtendExecutionLock(ctx, taskID, token, deliveryLockTTL)
 	if err != nil {
 		return fmt.Errorf("extend execution lock: %w", err)
 	}
 	if !extended {
-		return fmt.Errorf("execution lock lost before delivery for task %s", delivery.TaskID)
+		return fmt.Errorf("execution lock lost before delivery for task %s", taskID)
 	}
 
 	// Step D：原样发送 BYTEA 载荷并自动附带 X-Ferry-* 与 HMAC-SHA256 签名头。
@@ -331,7 +377,6 @@ func (w *Worker) ProcessDelivery(ctx context.Context, delivery domain.ReadyDeliv
 		)
 	}
 
-	ackDelivery(delivery)
 	return nil
 }
 

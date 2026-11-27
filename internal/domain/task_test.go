@@ -212,3 +212,189 @@ func TestParseAttemptErrorKind_ValidAndUnknown(t *testing.T) {
 		t.Fatal("expected error for unknown AttemptErrorKind")
 	}
 }
+
+func TestNewTask_DeliverAtWindowBounds(t *testing.T) {
+	now := time.Date(2026, 11, 23, 10, 0, 0, 0, time.UTC)
+	ep, err := domain.NewEndpoint(domain.NewEndpointParams{
+		Name:      "orders",
+		TargetURL: "http://localhost:8081/webhook",
+	}, now)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %v", err)
+	}
+
+	const maxWindow = 30 * 24 * time.Hour
+	validCases := []struct {
+		name         string
+		deliverAt    time.Time
+		wantDeadline time.Time
+	}{
+		{
+			name:         "equal_now_immediate",
+			deliverAt:    now,
+			wantDeadline: now.Add(24 * time.Hour),
+		},
+		{
+			name:         "future_ten_minutes",
+			deliverAt:    now.Add(10 * time.Minute),
+			wantDeadline: now.Add(10*time.Minute + 24*time.Hour),
+		},
+		{
+			name:         "exact_thirty_days_boundary",
+			deliverAt:    now.Add(maxWindow),
+			wantDeadline: now.Add(maxWindow + 24*time.Hour),
+		},
+	}
+
+	for _, tc := range validCases {
+		t.Run(tc.name, func(t *testing.T) {
+			deliverAt := tc.deliverAt
+			task, err := domain.NewTask(domain.NewTaskParams{
+				Endpoint:       ep,
+				IdempotencyKey: "deliver-" + tc.name,
+				RawPayload:     []byte(`{"ok":true}`),
+				DeliverAt:      &deliverAt,
+				MaxAttempts:    1,
+				DefaultWindow:  24 * time.Hour,
+				Now:            now,
+			})
+			if err != nil {
+				t.Fatalf("NewTask(%s) unexpected error: %v", tc.name, err)
+			}
+			if !task.NextRunAt.Equal(tc.deliverAt) {
+				t.Fatalf("expected NextRunAt=%v, got %v", tc.deliverAt, task.NextRunAt)
+			}
+			if !task.DeadlineAt.Equal(tc.wantDeadline) {
+				t.Fatalf("expected DeadlineAt=%v, got %v", tc.wantDeadline, task.DeadlineAt)
+			}
+		})
+	}
+
+	t.Run("beyond_thirty_days_rejected", func(t *testing.T) {
+		tooFar := now.Add(maxWindow + time.Millisecond)
+		_, err := domain.NewTask(domain.NewTaskParams{
+			Endpoint:       ep,
+			IdempotencyKey: "deliver-too-far",
+			RawPayload:     []byte(`{"ok":true}`),
+			DeliverAt:      &tooFar,
+			MaxAttempts:    1,
+			DefaultWindow:  24 * time.Hour,
+			Now:            now,
+		})
+		var valErr domain.ValidationError
+		if !errors.As(err, &valErr) || valErr.Field != "deliver_at" {
+			t.Fatalf("expected ValidationError on deliver_at, got %v", err)
+		}
+	})
+
+	t.Run("explicit_deadline_must_exceed_future_deliver_at", func(t *testing.T) {
+		future := now.Add(2 * time.Hour)
+		badDeadline := future
+		_, err := domain.NewTask(domain.NewTaskParams{
+			Endpoint:       ep,
+			IdempotencyKey: "deliver-bad-deadline",
+			RawPayload:     []byte(`{"ok":true}`),
+			DeliverAt:      &future,
+			DeadlineAt:     &badDeadline,
+			MaxAttempts:    1,
+			DefaultWindow:  24 * time.Hour,
+			Now:            now,
+		})
+		if !errors.Is(err, domain.ErrValidation) {
+			t.Fatalf("expected ErrValidation when deadline_at <= deliver_at, got %v", err)
+		}
+	})
+}
+
+func TestTask_EvaluatePreDeliveryStrictForScheduledAndRetryingTasks(t *testing.T) {
+	now := time.Date(2026, 11, 24, 10, 0, 0, 0, time.UTC)
+	ep, err := domain.NewEndpoint(domain.NewEndpointParams{
+		Name:      "scheduled-guard",
+		TargetURL: "http://localhost:8081/webhook",
+	}, now)
+	if err != nil {
+		t.Fatalf("NewEndpoint failed: %v", err)
+	}
+
+	futureDeliverAt := now.Add(10 * time.Second)
+	scheduled, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: "sched-strict-1",
+		RawPayload:     []byte(`{"k":1}`),
+		DeliverAt:      &futureDeliverAt,
+		MaxAttempts:    3,
+		DefaultWindow:  time.Hour,
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("NewTask(scheduled) failed: %v", err)
+	}
+
+	immediate, err := domain.NewTask(domain.NewTaskParams{
+		Endpoint:       ep,
+		IdempotencyKey: "imm-skew-1",
+		RawPayload:     []byte(`{"k":1}`),
+		MaxAttempts:    3,
+		DefaultWindow:  time.Hour,
+		Now:            now,
+	})
+	if err != nil {
+		t.Fatalf("NewTask(immediate) failed: %v", err)
+	}
+
+	retrying := immediate
+	retrying.Status = domain.TaskStatusRetrying
+	retrying.Attempt = 1
+	retrying.NextRunAt = now.Add(5 * time.Second)
+
+	cases := []struct {
+		name              string
+		task              domain.Task
+		evalNow           time.Time
+		wantEarlyArrival  bool
+		wantShouldDeliver bool
+	}{
+		{
+			name:             "scheduled_500ms_early_blocked",
+			task:             scheduled,
+			evalNow:          futureDeliverAt.Add(-500 * time.Millisecond),
+			wantEarlyArrival: true,
+		},
+		{
+			name:             "scheduled_1ms_early_blocked",
+			task:             scheduled,
+			evalNow:          futureDeliverAt.Add(-time.Millisecond),
+			wantEarlyArrival: true,
+		},
+		{
+			name:              "scheduled_exact_due_allowed",
+			task:              scheduled,
+			evalNow:           futureDeliverAt,
+			wantShouldDeliver: true,
+		},
+		{
+			name:             "retrying_500ms_early_blocked",
+			task:             retrying,
+			evalNow:          retrying.NextRunAt.Add(-500 * time.Millisecond),
+			wantEarlyArrival: true,
+		},
+		{
+			name:              "immediate_500ms_clock_skew_allowed",
+			task:              immediate,
+			evalNow:           now.Add(-500 * time.Millisecond),
+			wantShouldDeliver: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			decision, err := tc.task.EvaluatePreDelivery(ep, tc.evalNow)
+			if err != nil {
+				t.Fatalf("EvaluatePreDelivery failed: %v", err)
+			}
+			if decision.EarlyArrival != tc.wantEarlyArrival || decision.ShouldDeliver != tc.wantShouldDeliver {
+				t.Fatalf("got decision=%+v, want EarlyArrival=%v ShouldDeliver=%v", decision, tc.wantEarlyArrival, tc.wantShouldDeliver)
+			}
+		})
+	}
+}

@@ -217,3 +217,10 @@ func toDomainDeliveryAttempt(po deliveryAttemptPO) (domain.DeliveryAttempt, erro
 		CreatedAt:       po.CreatedAt.UTC(),
 	}, nil
 }
+
+func toDomainOutboxItem(po outboxPO) domain.OutboxItem {
+	return domain.OutboxItem{
+		TaskID:    po.TaskID,
+		DeliverAt: po.DeliverAt.UTC(),
+	}
+}

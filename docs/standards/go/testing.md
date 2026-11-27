@@ -17,7 +17,7 @@
 | 配置与日志 | `internal/config/*_test.go`、`internal/logger/*_test.go` | 环境变量解析与强校验、采样日志与 `WithTaskID` 透传、GORM 慢查询日志适配 | 纯内存 |
 | 出站 HTTP 客户端 | `internal/infra/httpclient/*_test.go` | 原始字节与签名头透传、超时、响应截断、禁 3xx 重定向、2xx 读体失败保护、状态码分类与 `Retry-After` 解析 | 本地 `httptest.Server` |
 | PostgreSQL 存储 | `internal/infra/pg/store_test.go` | SQL 事务与约束：`ON CONFLICT DO NOTHING` 并发幂等、`BYTEA` 保真、乐观锁更新与取消竞态、`SKIP LOCKED` 锁定与回滚、`LISTEN/NOTIFY` 触发器、`Endpoint` `updated_at` 乐观锁 | 跑完迁移的真实 PostgreSQL |
-| Redis 适配器 | `internal/infra/redis/*_test.go` | 原子操作与 Lua 脚本：`SetNX` 互斥、验主续期（`PEXPIRE`）与释放、过期接管防误删、延迟池租约与流控脚本 | 真实 Redis（DB 15） |
+| Redis 适配器 | `internal/infra/redis/*_test.go` | 原子操作与 Lua 脚本：`SetNX` 互斥、验主续期（`PEXPIRE`）与释放、过期接管防误删、延迟池租约与流控脚本 | 真实 Redis（DB 14） |
 | Kafka 适配器 | `internal/infra/kafka/reader_test.go`、`stream_test.go` | `reader_test.go` 测连续 Offset 水位推进与分区撤销边界；`stream_test.go` 测真实 Broker 生产、消费、乱序 `Ack` 与重启恢复 | 内存 + 真实 Kafka |
 | 端到端集成测试 | `tests/integration/<scene>_integration_test.go` | 一条核心业务主链路一个文件：真实组装 `api`、`scheduler`、`worker`、`pg`、`redis`、`kafka`、`httpclient` 与 `httptest` 下游，验证跨层协作 | 真实 PG + Redis + Kafka |
 | 多进程黑盒脚本 | `scripts/verify_m*.sh` | 编译并启动真实 `ferry-server`、`ferry-worker`、`chaos-receiver` 独立进程，验证端口监听、健康探针与真实 `SIGTERM` 优雅停机 | 真实容器与编译产物 |
@@ -71,7 +71,7 @@ if testing.Short() {
 | 环境变量 | 默认值 | 隔离方式 |
 | :--- | :--- | :--- |
 | `FERRY_TEST_PG_DSN` | `postgres://ferry:ferry@localhost:5432/ferry?sslmode=disable` | 每条测试创建独立临时库 `ferry_<scope>_<pid>_<ts>` 并执行内嵌 Goose 迁移，`t.Cleanup` 运行 `DROP DATABASE ... WITH (FORCE)` 清理 |
-| `FERRY_TEST_REDIS_ADDR`、`FERRY_TEST_REDIS_DB`、`FERRY_TEST_REDIS_PASSWORD` | `localhost:6379`、`15`、空 | 固定连接测试专用 DB 15；任务级 Key 用新 UUIDv7 隔离，测全局共享 Key（如 `ferry:delayed`）前后清理 DB 15 |
+| `FERRY_TEST_REDIS_ADDR`、`FERRY_TEST_REDIS_UNIT_DB`、`FERRY_TEST_REDIS_DB`、`FERRY_TEST_REDIS_PASSWORD` | `localhost:6379`、`14`、`15`、空 | `internal/infra/redis` 固定使用 DB 14、`tests/integration` 固定使用 DB 15，避免多包并行冲突；任务级 Key 用新 UUIDv7 隔离，测全局共享 Key（如 `ferry:delayed`）前后清理本库 |
 | `FERRY_TEST_KAFKA_BROKERS` | `localhost:9092` | 每条测试创建随机 Topic（`ferry.test.ready.<short-id>` 或 `ferry.it.ready.<short-id>`）与独立消费组，`t.Cleanup` 用 `kadm.DeleteTopics` 删除 |
 
 ## 文件、包名与测试写法

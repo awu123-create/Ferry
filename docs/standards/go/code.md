@@ -44,7 +44,7 @@
   - 入口幂等使用数据库 `UNIQUE` 索引 + GORM `clause.OnConflict{DoNothing: true}`，零行命中时在同事务回查并经 `VerifyIdempotentReplay` 校验载荷哈希与 Headers；
   - Outbox 抢占与死信批量重放使用 `clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"}`，回调式事务强制绑定 `5s` 超时 Context 防止长事务阻塞 Autovacuum；
   - 状态迁移使用条件 `Updates` 检查 `RowsAffected`：Worker 结算与预投递死信携带 `(replay_count, attempt)` 复合乐观锁，`CancelTask` 在持有 Redis `Execution Lock` 前提下以 `status IN ('PENDING', 'RETRYING')` 执行 CAS，`UpdateEndpoint` 携带 `expectedUpdatedAt` 乐观锁。
-- Redis 跨 Key 或“先验持有人再续期/删除”的原子操作（`Execution Lock` 验主续期与释锁、延迟池 30s 租约与比对分数条件 `ZREM`、三维流控脚本）统一用 `redis.NewScript` 封装，且脚本内统一调用 `redis.call('TIME')` 消除多机时钟偏差；禁止对锁执行裸 `DEL`（详见 `docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md`）。
+- Redis 跨 Key 或“先验持有人再续期/删除”的原子操作（`Execution Lock` 校验 token 续期与释锁、延迟池 30s 租约与 `ferry:delayed:lease` 校验条件 `HDEL + ZREM`、取消标记 `ferry:delayed:cancelled:<id>` 原子拒写、三维流控脚本）统一用 `redis.NewScript` 封装，且脚本内统一调用 `redis.call('TIME')` 消除多机时钟偏差；禁止对锁执行裸 `DEL`（详见 `docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md`）。
 
 ## 错误处理（Errors）
 
@@ -61,7 +61,7 @@
 
 ## 出站调用（Outbound calls）
 
-- 禁止在 PostgreSQL 数据库事务内发起外部 HTTP 请求或不可控外部调用（Outbox 回调推 Kafka 是绑定 `5s` 硬超时的唯一特例）。
+- 禁止在 PostgreSQL 数据库事务内发起外部 HTTP 请求或不可控外部调用（Outbox 双通道回调推 Kafka 或写 Redis 延迟池是绑定 `5s` 硬超时的特例）。
 - 所有出站 HTTP 投递统一走 `internal/infra/httpclient.Sender`：必须携带带超时的 `ctx`、禁用自动跟随 3xx 重定向（`CheckRedirect` 返回 `http.ErrUseLastResponse`）、响应体用有界 `io.LimitReader` 截断防 OOM 并确保 `resp.Body.Close()`、单次尝试不内置重试、过滤上游透传的 `Host` 与 `X-Ferry-*` 保留头。
 
 ## 日志与指标（Logging and metrics）

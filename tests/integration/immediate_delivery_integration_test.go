@@ -71,8 +71,8 @@ func TestImmediateDeliveryIntegration(t *testing.T) {
 	defer downstream.Close()
 
 	// 先启动 Relay 与 Worker，验证整条链路实时推进。
-	h.startRelay()
-	h.startWorker()
+	h.relayRunner.start()
+	h.workerRunner.start()
 
 	epOK := h.createEndpoint("ok-endpoint", downstream.URL+"/ok", signingSecret, 5000)
 	if !epOK.HasSigningSecret {
