@@ -27,7 +27,8 @@ var (
 )
 
 // AcquireExecutionLock 尝试为指定 taskID 获取短时排他执行互斥锁（Execution Lock），
-// Key 格式为 ferry:lock:task:<task_id>，抢锁成功返回唯一持有人 token（ADR-0008 §3）。
+// Key 格式为 ferry:lock:task:<task_id>，抢锁成功返回唯一持有人 token
+// （见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (c *Client) AcquireExecutionLock(ctx context.Context, taskID uuid.UUID, ttl time.Duration) (string, bool, error) {
 	if ttl <= 0 {
 		return "", false, fmt.Errorf("execution lock ttl must be > 0")
@@ -79,7 +80,7 @@ func executionLockKey(taskID uuid.UUID) string {
 }
 
 // ReleaseExecutionLock 仅当 Redis 中存储的值等于 token 时才通过 Lua 原子释放 Execution Lock，
-// 防止锁过期后误删新持有者的互斥锁（ADR-0008 §3）。
+// 防止锁过期后误删新持有者的互斥锁（见 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (c *Client) ReleaseExecutionLock(ctx context.Context, taskID uuid.UUID, token string) error {
 	if taskID == uuid.Nil {
 		return fmt.Errorf("execution lock task id must not be empty")

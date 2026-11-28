@@ -62,8 +62,9 @@ git push --force-with-lease
    - 改动文件通过 `pre-commit run --files <changed-files>`（或 `pre-commit run --all-files`，覆盖尾部空白、EOF 换行、YAML、冲突标记、私钥检测、Shell 脚本（`*.sh`）静态检查与 `.golangci.yml` 全量校验）。
 2. **Go 静态检查、单测与构建**（涉及 Go 代码或 lint 配置时）
    - `make fmt-check`（未格式化时先执行 `make fmt`）
+   - `make check-adr`
    - `make check-scripts`（涉及 Shell 脚本时）
-   - `make lint`（`golangci-lint config verify` + `golangci-lint run ./...`，含 `depguard`、`json_v2`、`usestdlibvars`、`testpackage`、`forbidigo` 门禁）
+   - `make lint`（`golangci-lint config verify` + `golangci-lint run ./...`）
    - `make test`（`go test -race -short ./...`）
    - `make build`
 3. **集成与黑盒验收**（涉及数据库迁移、存储适配器、中间件、调度或投递链路时）
@@ -73,9 +74,10 @@ git push --force-with-lease
    - 分支新增的 `migrations/NNNN_*.sql` 编号必须严格大于 `main` 上最新迁移版本号；
    - 拉齐 `main` 后如发生撞号或倒挂，保留 `main` 已有版本号不动，用 `git mv` 按序顺延本分支所有新增迁移文件，同步修正测试中写死的版本号后重跑 `make test-integration`；
    - 同一未合入 PR 内对新增迁移的修正直接原地修改，不追加补丁迁移文件。
-5. **ADR 与领域词表一致性**
-   - 涉及 `docs/adr/` 时确保 `docs/adr/NNNN-*.md` 编号唯一（`adr-number-unique`）；
-   - 术语遵守 `GLOSSARY.md`（无禁用同义词），改动未静默违背既有 ADR。
+5. **ADR、领域词表与工单记录同步**
+   - `make check-adr` 通过（`docs/adr/NNNN-*.md` 编号唯一，且代码与文档无裸写短号）；
+   - 术语遵守 `GLOSSARY.md`（无禁用同义词），改动未静默违背既有 ADR；
+   - 若 PR 经实现或审查调整后与原关联 Issue 描述出现协议或边界差异，合入前在原 Issue 下补一条简明偏差说明评论，避免后续切片按过期工单开发。
 6. **GitHub PR 门禁与单向门确认**
    - 分支已与最新 `origin/main` 同步（满足 Ruleset `strict_required_status_checks_policy`）；
    - `Protect main` 必需检查全绿：`Lint, Test & Build`、`Integration Tests (PG + Kafka + Redis)`；

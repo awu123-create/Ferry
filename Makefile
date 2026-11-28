@@ -22,12 +22,7 @@ fmt-check:
 	fi
 
 check-adr:
-	@set -euo pipefail; \
-	dups="$$(ls docs/adr | sed -n 's/^\([0-9]\{4\}\)-.*/\1/p' | sort | uniq -d)"; \
-	if [ -n "$$dups" ]; then \
-		printf "Duplicate ADR numeric prefixes:\n%s\n" "$$dups"; \
-		exit 1; \
-	fi
+	./scripts/check_adr.sh
 
 check-scripts:
 	SHELLCHECK="$(SHELLCHECK)" ./scripts/check_scripts.sh

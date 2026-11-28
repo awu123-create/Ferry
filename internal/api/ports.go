@@ -33,7 +33,7 @@ type ExecutionLocker interface {
 
 // DelayedCanceller 在任务取消落盘后清理延迟池记录，并写入带过期时间的取消标记阻止迟到的写回。
 type DelayedCanceller interface {
-	CancelDelayed(ctx context.Context, taskID uuid.UUID, tombstoneTTL time.Duration) error
+	CancelDelayed(ctx context.Context, taskID uuid.UUID, cancelMarkerTTL time.Duration) error
 }
 
 // ReadinessProbe 用于 /readyz 检查下游基础设施组件的就绪状态。

@@ -53,7 +53,7 @@ Ferry/
   - `deploy/docker-compose.yml`（PostgreSQL 16 + Kafka KRaft + Redis 7 基础编排）与 `.github/workflows/ci.yml` 集成测试任务；
   - `.golangci.yml` 新增 `json_v2` `depguard` 规则（随 M1 首个代码 PR 启用）；
   - `migrations/` 初始迁移 + `embed.go`（建立 M1 所需的 `endpoints`、`tasks`、`task_attempts`、`outbox` 核心结构、幂等唯一约束、`outbox` 索引与 `NOTIFY` 触发器；M2/M3 专属索引与列留待对应 Milestone 增量迁移引入）；
-  - `internal/infra/redis`（带持有人 `token` 验主续期与释放的 `Execution Lock`）；
+  - `internal/infra/redis`（带持有人 `token` 核对续期与释放的 `Execution Lock`）；
   - `cmd/ferry-server`（API：`POST/GET/PATCH /v1/endpoints`、`POST/GET /v1/tasks`、`GET /v1/tasks/{id}/attempts`、`POST /v1/tasks/{id}/cancel`、`/healthz`、`/readyz`；内置 Outbox 立即通道处理 `deliver_at <= now()` 直推 Kafka）；
   - `cmd/ferry-worker`（Kafka 消费、`Execution Lock` + 乐观锁守卫、HMAC-SHA256 原始字节签名投递、写 `task_attempts`、2xx 迁移 `SUCCEEDED` / 失败迁移 `DEAD_LETTER`、25s `SIGTERM` 优雅停机）；
   - `cmd/chaos-receiver`（基础版：校验 `X-Ferry-Signature` 签名正确性、记录 `X-Ferry-Task-ID` 收到次数、支持返回指定状态码 `200`/`400`）。

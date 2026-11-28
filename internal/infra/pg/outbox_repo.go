@@ -127,7 +127,7 @@ func (s *Store) claimAndDispatchOutbox(
 }
 
 // WaitForOutboxNotification 复用专用 pgx 连接监听 PostgreSQL 通道 'ferry_outbox'，
-// 直到收到通知或 ctx 取消/超时（ADR-0006 §2.3）。
+// 直到收到通知或 ctx 取消/超时（见 docs/adr/0006-tech-stack-and-engineering-tooling.md）。
 func (s *Store) WaitForOutboxNotification(ctx context.Context) error {
 	s.listenMu.Lock()
 	defer s.listenMu.Unlock()

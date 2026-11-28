@@ -96,7 +96,8 @@ func (s *Store) SavePreDeliveryDeadLetter(
 }
 
 // SaveDeliveryOutcome 在单次 PostgreSQL 事务中追加 DeliveryAttempt 审计流水，
-// 并按复合乐观锁条件迁移 Task 状态（ADR-0007 & ADR-0008）。
+// 并按复合乐观锁条件迁移 Task 状态
+// （见 docs/adr/0007-tactical-ddd-and-deep-module-seams.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）。
 func (s *Store) SaveDeliveryOutcome(
 	ctx context.Context,
 	expectedReplayCount, expectedAttempt int,

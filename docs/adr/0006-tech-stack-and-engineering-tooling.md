@@ -33,7 +33,7 @@ Ferry 的总体架构与可靠性契约已在 [ADR-0001](./0001-unified-http-tas
 | **数据库迁移** | **`pressly/goose/v3`**（`embed.FS` + CLI） | 唯一 DDL 迁移入口，负责建表、部分索引、约束与 `outbox` 触发器；**严禁开启 GORM `AutoMigrate`** |
 | **主键生成** | **`google/uuid`**（`uuid.NewV7()`） | 时间序有序主键，防止高并发随机 `UUIDv4` 写入引发 PG B-Tree 索引页分裂 |
 | **HTTP 路由与投递** | **标准库 `net/http`**（增强 `ServeMux` + 定制 `http.Transport`） | 零框架承载 ~9 个 REST 接口；投递端手动调优连接池（`MaxIdleConns: 1000`、`MaxIdleConnsPerHost: 64`、`IdleConnTimeout: 90s`）并使用 `io.LimitReader` 截断大响应体防 OOM |
-| **Kafka 客户端** | **`twmb/franz-go`**（含 `pkg/kadm`） | 纯 Go 零 CGO，原生默认启用幂等生产者、`CooperativeSticky` 重平衡及分区级 `PauseFetchPartitions`（直接支撑 ADR-0004 Redis 断连背压暂停） |
+| **Kafka 客户端** | **`twmb/franz-go`**（含 `pkg/kadm`） | 纯 Go 零 CGO，原生默认启用幂等生产者、`CooperativeSticky` 重平衡及分区级 `PauseFetchPartitions`（直接支撑 [ADR-0004](./0004-endpoint-flow-control-and-three-layer-idempotency.md) Redis 断连背压暂停） |
 | **Redis 客户端** | **`redis/go-redis/v9`** | 驱动 `ferry:delayed` ZSet、`ferry:delayed:lease` Hash、取消标记、短锁与 `redis.NewScript`（自动 `EVALSHA` 并在 `FLUSHALL`/重启 `NOSCRIPT` 后自动重载 `EVAL`） |
 | **结构化日志** | **`go.uber.org/zap`** | JSON 格式输出；启用 `zapcore.NewSamplerWithOptions` 防下游雪崩刷屏拖垮磁盘；实现 GORM `logger.Interface` 接管慢 SQL 阈值告警（如 `> 200ms`）并透传 `task_id` |
 | **配置与组装** | **环境变量结构体 + `main.go` 显式构造** | 12-Factor 纯环境变量强校验，不引 `viper`/`fx`，保证优雅停机逆序排空路径完全显式可读 |
@@ -48,12 +48,12 @@ Ferry 的总体架构与可靠性契约已在 [ADR-0001](./0001-unified-http-tas
    - 状态机 CAS 守卫：`db.Model(&Task{}).Where("id = ? AND status IN ?", id, allowed).Updates(...)` 检查 `RowsAffected`；
 3. **Outbox 毫秒级唤醒与监听**：通过迁移脚本在 `outbox` 表挂载 `AFTER INSERT FOR EACH STATEMENT` 触发器执行 `PERFORM pg_notify('ferry_outbox', '')`；Go 端 Relay 直接从 `gorm.io/driver/postgres` 底层复用的 `jackc/pgx/v5` 连接池取单条连接调用 `WaitForNotification(ctx)`，无需业务层手写 SQL 也不额外引入第二个 PG 驱动。
 
-### 三、工程化质量门禁
+### 三、工程化质量门禁（初始基线）
 
-1. **`Makefile`**：当前工程骨架阶段提供 `setup-hooks`、`fmt`、`lint`、`test`、`build` 五个基础目标；`test-integration`、`migrate`、`up`、`down` 随 Milestone 1 容器编排与迁移脚本同步落地；
+1. **`Makefile`**：初始工程骨架阶段提供 `setup-hooks`、`fmt`、`lint`、`test`、`build` 五个基础目标；`test-integration`、`migrate`、`up`、`down` 随 Milestone 1 容器编排与迁移脚本同步落地；
 2. **`.golangci.yml`（v2）**：开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`（防漏关 HTTP 响应体泄漏连接）、`noctx`（强迫 HTTP/DB 调用带 `context.Context`）、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint` 与 `depguard`（以 `strict` 白名单锁死领域层与编排层不越界依赖基础设施实现）；
 3. **`.pre-commit-config.yaml`**：串联基础文件检查、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、`golangci-lint` 增量扫描与 `go test -short ./...`；
-4. **GitHub Actions CI（`.github/workflows/ci.yml`）**：当前骨架阶段运行 `verify` 任务（格式、ADR 编号、全量 lint、竞态单测与二进制编译）；`integration` 任务（拉起 `deploy/docker-compose.yml` 真实容器跑 `goose` 迁移与集成测试，不引入 `testcontainers-go`）随 Milestone 1 同步启用。
+4. **GitHub Actions CI（`.github/workflows/ci.yml`）**：初始骨架阶段运行 `verify` 任务（格式、ADR 编号、全量 lint、竞态单测与二进制编译）；`integration` 任务（拉起 `deploy/docker-compose.yml` 真实容器跑 `goose` 迁移与集成测试，不引入 `testcontainers-go`）随 Milestone 1 同步启用。
 
 ## 影响与取舍（Consequences & Trade-offs）
 

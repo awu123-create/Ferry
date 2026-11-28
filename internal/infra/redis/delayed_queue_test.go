@@ -282,7 +282,7 @@ func TestDelayedQueue_ContentionReplacesLeaseAndPreservesGenuineSchedule(t *test
 	}
 }
 
-func TestDelayedQueue_CancelTombstoneBlocksLateWritesAndPreservesBatchSiblings(t *testing.T) {
+func TestDelayedQueue_CancelMarkerBlocksLateWritesAndPreservesBatchSiblings(t *testing.T) {
 	client := openCleanDelayedRedis(t)
 	ctx := context.Background()
 	now := redisNow(t, client)
@@ -291,7 +291,7 @@ func TestDelayedQueue_CancelTombstoneBlocksLateWritesAndPreservesBatchSiblings(t
 	healthyID := uuid.New()
 
 	if err := client.CancelDelayed(ctx, cancelledID, 0); err == nil {
-		t.Fatal("expected error when tombstoneTTL <= 0")
+		t.Fatal("expected error when cancelMarkerTTL <= 0")
 	}
 
 	// 先把任务放进延迟池并领出挂租约，再调 CancelDelayed 清理并立下 2 分钟取消标记。
@@ -307,7 +307,7 @@ func TestDelayedQueue_CancelTombstoneBlocksLateWritesAndPreservesBatchSiblings(t
 
 	pttl, err := client.Raw().PTTL(ctx, "ferry:delayed:cancelled:"+cancelledID.String()).Result()
 	if err != nil || pttl <= 0 || pttl > 2*time.Minute {
-		t.Fatalf("expected tombstone key PTTL in (0, 2m], got pttl=%v err=%v", pttl, err)
+		t.Fatalf("expected cancel marker key PTTL in (0, 2m], got pttl=%v err=%v", pttl, err)
 	}
 	if _, err := client.Raw().ZScore(ctx, "ferry:delayed", cancelledID.String()).Result(); !errors.Is(err, goredis.Nil) {
 		t.Fatalf("expected cancelledID absent from ferry:delayed, got err=%v", err)
@@ -322,7 +322,7 @@ func TestDelayedQueue_CancelTombstoneBlocksLateWritesAndPreservesBatchSiblings(t
 		t.Fatalf("DeferContendedTask on cancelled task failed: %v", err)
 	}
 	if _, err := client.Raw().ZScore(ctx, "ferry:delayed", cancelledID.String()).Result(); !errors.Is(err, goredis.Nil) {
-		t.Fatalf("expected DeferContendedTask rejected by cancel tombstone, got err=%v", err)
+		t.Fatalf("expected DeferContendedTask rejected by cancel marker, got err=%v", err)
 	}
 
 	futureRunAt := now.Add(30 * time.Second).Truncate(time.Millisecond)
@@ -330,7 +330,7 @@ func TestDelayedQueue_CancelTombstoneBlocksLateWritesAndPreservesBatchSiblings(t
 		t.Fatalf("ScheduleDelayed on cancelled task failed: %v", err)
 	}
 	if _, err := client.Raw().ZScore(ctx, "ferry:delayed", cancelledID.String()).Result(); !errors.Is(err, goredis.Nil) {
-		t.Fatalf("expected ScheduleDelayed rejected by cancel tombstone, got err=%v", err)
+		t.Fatalf("expected ScheduleDelayed rejected by cancel marker, got err=%v", err)
 	}
 
 	if err := client.ScheduleDelayedBatch(ctx, []domain.OutboxItem{

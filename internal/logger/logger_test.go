@@ -11,6 +11,7 @@ import (
 	"go.uber.org/zap/zapcore"
 	"go.uber.org/zap/zaptest/observer"
 	"gorm.io/gorm"
+	gormlogger "gorm.io/gorm/logger"
 
 	"github.com/awu123-create/ferry/internal/logger"
 )
@@ -75,5 +76,44 @@ func TestGormLogger_TraceSlowSQLAndNotFoundIgnored(t *testing.T) {
 	}
 	if logs.All()[1].Level != zapcore.ErrorLevel {
 		t.Fatalf("expected error level on query error, got %v", logs.All()[1].Level)
+	}
+}
+
+func TestGormLogger_InfoWarnErrorStructuredDetail(t *testing.T) {
+	core, logs := observer.New(zapcore.DebugLevel)
+	glog := logger.NewGormLogger(zap.New(core), 10*time.Millisecond).LogMode(gormlogger.Info)
+
+	taskID := uuid.New()
+	ctx := logger.WithTaskID(context.Background(), taskID)
+
+	glog.Info(ctx, "connected to %s:%d", "pg", 5432)
+	glog.Warn(ctx, "pool near capacity %d%%", 85)
+	glog.Error(ctx, "tx rollback: %s", "deadlock")
+
+	entries := logs.All()
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 log entries, got %d", len(entries))
+	}
+
+	want := []struct {
+		level  zapcore.Level
+		msg    string
+		detail string
+	}{
+		{level: zapcore.InfoLevel, msg: "gorm info", detail: "connected to pg:5432"},
+		{level: zapcore.WarnLevel, msg: "gorm warn", detail: "pool near capacity 85%"},
+		{level: zapcore.ErrorLevel, msg: "gorm error", detail: "tx rollback: deadlock"},
+	}
+	for i, w := range want {
+		if entries[i].Level != w.level || entries[i].Message != w.msg {
+			t.Fatalf("entry[%d] expected (%v, %q), got (%v, %q)", i, w.level, w.msg, entries[i].Level, entries[i].Message)
+		}
+		fields := entries[i].ContextMap()
+		if fields["detail"] != w.detail {
+			t.Fatalf("entry[%d] expected detail=%q, got %v", i, w.detail, fields["detail"])
+		}
+		if fields["task_id"] != taskID.String() {
+			t.Fatalf("entry[%d] expected task_id=%s, got %v", i, taskID, fields["task_id"])
+		}
 	}
 }

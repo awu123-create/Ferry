@@ -17,7 +17,7 @@ import (
 const (
 	taskEnvelopeOverheadBytes = 64 << 10
 	cancelCleanupTimeout      = 5 * time.Second
-	cancelTombstoneTTL        = 10 * time.Minute
+	cancelMarkerTTL           = 10 * time.Minute
 )
 
 type createTaskRequest struct {
@@ -289,7 +289,7 @@ func (h *Handler) cancelTask(ctx context.Context, taskID uuid.UUID) (domain.Task
 
 	cleanupCtx, cancelCleanup := context.WithTimeout(context.WithoutCancel(ctx), cancelCleanupTimeout)
 	defer cancelCleanup()
-	if rmErr := h.delayed.CancelDelayed(cleanupCtx, taskID, cancelTombstoneTTL); rmErr != nil {
+	if rmErr := h.delayed.CancelDelayed(cleanupCtx, taskID, cancelMarkerTTL); rmErr != nil {
 		h.log.Warn(
 			"cancel delayed task cleanup failed",
 			zap.String("task_id", taskID.String()),

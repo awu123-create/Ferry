@@ -28,13 +28,13 @@
 
 采纳 **方案 1**，核心边界与契约规范如下：
 
-### 一、统一语言正交化与五态持久化修正（局部更新 ADR-0005）
+### 一、统一语言正交化与五态持久化修正（局部更新 [ADR-0005](./0005-state-machine-dlq-replay-and-observability-boundary.md)）
 
 1. **单一限界上下文词表**：在仓库根目录维护无基础设施实现泄漏的 [`GLOSSARY.md`](../../GLOSSARY.md)，确立关键正交概念：
    - **Deferral（流控顺延）vs Retry（失败退避重试）**：前者在准入阶段被熔断/QPS/并发上限拦截时发生，不发 HTTP、不写 `DeliveryAttempt`、不递增 `attempt`、准入热路径不改写任务持久化状态（仅受 `Deadline` 封顶，并由后台对账惰性对齐 `NextRunAt`）；后者仅在实际发起 HTTP 请求并遭遇可重试故障后发生，生成 `DeliveryAttempt`、递增 `attempt`、迁移至 `RETRYING` 并推进 `NextRunAt`；
    - **NextRunAt**：领域内唯一的计划触发时间属性（`deliver_at` 仅作入站 HTTP DTO 参数与 `outbox` 表字段名）；
    - **三类带期限协调原语**：彻底拆分为 `Schedule Lease`（30s 延迟转发可见性租约）、`Execution Lock`（单任务单次投递互斥锁）与 `Concurrency Slot`（Endpoint 级带超时回收的在途并发槽位）。
-2. **持久化五态模型（局部修正 ADR-0005）**：
+2. **持久化五态模型（局部修正 [ADR-0005](./0005-state-machine-dlq-replay-and-observability-boundary.md)）**：
    - 取消热路径投递前向 PG 写入 `UPDATE status = 'RUNNING'`，将 PG `tasks.status` 持久化状态严格收敛为 **`PENDING`、`RETRYING`、`SUCCEEDED`、`DEAD_LETTER`、`CANCELLED` 五个状态**；
    - **工程依据**：① 避免每笔投递使 `tasks` 表写放大与 MVCC 死元组翻倍；② 防止 Worker 在 HTTP 期间遭遇 `kill -9` 且 Kafka 消息未重投时，停留在 `RUNNING` 的行脱离 `tasks_reconcile_idx`（仅索引 `PENDING, RETRYING`）成为永久孤儿；
    - **在途状态与取消真互斥**：任务“是否正在执行中”由 `Execution Lock` 唯一表达；`POST /v1/tasks/{id}/cancel` 自身先通过 `SET NX` 抢占 `Execution Lock`（抢锁失败说明在途执行中，直接返回 `409 Conflict`），持锁后在单事务内以 PG CAS `WHERE id = $1 AND status IN ('PENDING', 'RETRYING')` 迁移至 `CANCELLED` 并清理未派发 `outbox`，提交后原子清理延迟池并写入取消标记再释放锁（详见 [ADR-0008](./0008-concurrency-fencing-and-flow-control-hardening.md)）。Worker 侧更新统一携带 `(replay_count, attempt)` 复合乐观版本守卫；若极端锁超时下取消与在途请求重叠，Worker 结算事务的 CAS 未命中（返回 `applied = false`）不覆盖终态，但**依然同事务追加写入该次已实际发出的 `DeliveryAttempt` 审计行**。

@@ -11,7 +11,8 @@ import (
 	"github.com/awu123-create/ferry/internal/domain"
 )
 
-// GetTask 根据 ID 读取单行 Task，不加载历史 DeliveryAttempt 明细以防聚合膨胀（ADR-0007）。
+// GetTask 根据 ID 读取单行 Task，不加载历史 DeliveryAttempt 明细以防聚合膨胀
+// （见 docs/adr/0007-tactical-ddd-and-deep-module-seams.md）。
 func (s *Store) GetTask(ctx context.Context, id uuid.UUID) (domain.Task, error) {
 	var po taskPO
 	err := s.db.WithContext(ctx).Where("id = ?", id).First(&po).Error

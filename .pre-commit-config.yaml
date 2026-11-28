@@ -17,10 +17,10 @@ repos:
   - repo: local
     hooks:
       - id: adr-number-unique
-        name: ADR numeric prefixes are unique
+        name: ADR numbering and full-path references
         language: system
-        entry: make check-adr
-        files: ^docs/adr/[0-9].*\.md$
+        entry: scripts/check_adr.sh
+        files: ^(cmd/|internal/|tests/|scripts/|migrations/|docs/|.*\.md$)
         pass_filenames: false
 
       - id: ferry-shell-scripts
