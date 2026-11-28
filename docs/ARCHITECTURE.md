@@ -338,7 +338,7 @@ Ferry/
 ├── migrations/                # Goose 初始迁移 0001_init.sql 与 embed.go
 ├── tests/integration/         # 真实 PG + Kafka + Redis 端到端集成测试 (*_integration_test.go)
 ├── deploy/                    # docker-compose.yml（PostgreSQL 16 / Kafka 3.9 KRaft / Redis 7.4）
-├── scripts/                   # check_scripts.sh 脚本静态校验与 verify_m1.sh 多进程黑盒验收脚本
+├── scripts/                   # check_adr.sh / check_scripts.sh 静态校验与 verify_m1.sh 多进程黑盒验收脚本
 └── docs/
     ├── ARCHITECTURE.md        # 本架构设计总纲
     ├── adr/                   # ADR 0001 ~ 0008

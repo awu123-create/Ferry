@@ -4,12 +4,21 @@
 
 ## 环境准备与本地工具
 
-前置依赖：Go 1.27、Docker Compose、[`shellcheck`](https://www.shellcheck.net/)（macOS 可执行 `brew install shellcheck`，供 `make check-scripts` 与本地 `pre-commit` 校验 Shell 脚本）。
+`Makefile` 不内置依赖安装命令；本地开发与提交前检查请按以下固定版本自行准备工具，与 [.github/workflows/ci.yml](./.github/workflows/ci.yml) 保持一致：
 
-首次拉取仓库后，依次安装本地检查工具并挂载 Git 提交钩子（两个目标职责独立）：
+- **Go 1.27** 与 **Docker Compose**（真容器测试与本地运行）
+- **`golangci-lint` `v2.15.0`**（需确保 `$(go env GOBIN)` 或 `$(go env GOPATH)/bin` 在 `PATH` 中，且优先于系统包管理器里的旧版本）：
 
 ```bash
-make install-tools             # 安装固定版本 golangci-lint 与缺省时的 pre-commit
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+```
+
+- **[`shellcheck`](https://www.shellcheck.net/)**（供 `make check-scripts` 与本地 `pre-commit` 校验 Shell 脚本，macOS 可用 `brew install shellcheck`，Linux 使用系统包管理器安装）
+- **`pre-commit` `>= 3.2.0`**（按习惯任选其一，如 `uv tool install pre-commit`、`pipx install pre-commit` 或 `brew install pre-commit`）
+
+工具就绪后，挂载 Git 提交钩子：
+
+```bash
 make setup-hooks               # 执行 pre-commit install --install-hooks
 ```
 

@@ -19,7 +19,7 @@ repos:
       - id: adr-number-unique
         name: ADR numbering and full-path references
         language: system
-        entry: make check-adr
+        entry: scripts/check_adr.sh
         files: ^(cmd/|internal/|tests/|scripts/|migrations/|docs/|.*\.md$)
         pass_filenames: false
 
