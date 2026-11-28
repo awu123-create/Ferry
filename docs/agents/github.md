@@ -59,10 +59,10 @@ git push --force-with-lease
 
 1. **工作区与基础门禁**
    - `git status` 干净，无遗留临时文件或跨切片越界改动；
-   - 改动文件通过 `pre-commit run --files <changed-files>`（或 `pre-commit run --all-files`，覆盖尾部空白、EOF 换行、YAML、冲突标记、私钥检测、`scripts/*.sh` 静态检查与 `.golangci.yml` 全量校验）。
+   - 改动文件通过 `pre-commit run --files <changed-files>`（或 `pre-commit run --all-files`，覆盖尾部空白、EOF 换行、YAML、冲突标记、私钥检测、Shell 脚本（`*.sh`）静态检查与 `.golangci.yml` 全量校验）。
 2. **Go 静态检查、单测与构建**（涉及 Go 代码或 lint 配置时）
    - `make fmt-check`（未格式化时先执行 `make fmt`）
-   - `make check-scripts`（涉及 `scripts/*.sh` 时）
+   - `make check-scripts`（涉及 Shell 脚本时）
    - `make lint`（`golangci-lint config verify` + `golangci-lint run ./...`，含 `depguard`、`json_v2`、`usestdlibvars`、`testpackage`、`forbidigo` 门禁）
    - `make test`（`go test -race -short ./...`）
    - `make build`

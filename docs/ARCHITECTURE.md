@@ -303,7 +303,7 @@ CREATE TRIGGER outbox_notify_trg
 
 - **`Makefile`**：统一封装 `setup-hooks`、`fmt`、`fmt-check`、`check-adr`、`check-scripts`、`lint`、`test`（`-short` 无容器快测）、`test-integration`（全量真容器测试）、`up`、`down`、`migrate`、`verify-m1` 与 `build`；
 - **`.golangci.yml`（v2）**：强制开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`、`noctx`、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint`、`usestdlibvars`、`testpackage`、`forbidigo`（禁止 `internal/{domain,infra/pg}` 生产代码裸调 `time.Now`）与 `depguard`（包含全局 `json_v2` 规则禁止旧 `encoding/json`，并对 `domain` 与 `{api,scheduler,worker}` 启用 `strict` 白名单门禁，锁死零跨层越界依赖）；
-- **`.pre-commit-config.yaml`**：基础文本/YAML/私钥检查、`shellcheck`（`shellcheck-py`）与 `bash -n` 脚本校验、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、监听 `.golangci.yml` 的全量 `make lint`、`golangci-lint` 增量扫描与 `go test -short ./...`；
+- **`.pre-commit-config.yaml`**：基础文本/YAML/私钥检查、系统 `shellcheck` 与 `bash -n` 脚本校验、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、监听 `.golangci.yml` 的全量 `make lint`、`golangci-lint` 增量扫描与 `go test -short ./...`；
 - **GitHub Actions CI（`.github/workflows/ci.yml`）**：并行运行 `verify`（复用 `Makefile` 执行格式、ADR 编号、脚本 `shellcheck`、全量 lint、竞态短单测与二进制构建）与 `integration`（拉起 `deploy/docker-compose.yml` 真实 PG/Kafka/Redis 容器依次执行 `make test-integration` 与 `timeout 120 env SKIP_TESTS=1 make verify-m1`），与仓库 `Protect main` 规则集保持一致。
 
 ---
@@ -335,7 +335,7 @@ Ferry/
 ├── migrations/                # Goose 初始迁移 0001_init.sql 与 embed.go
 ├── tests/integration/         # 真实 PG + Kafka + Redis 端到端集成测试 (*_integration_test.go)
 ├── deploy/                    # docker-compose.yml（PostgreSQL 16 / Kafka 3.9 KRaft / Redis 7.4）
-├── scripts/                   # verify_m1.sh 多进程黑盒验收脚本
+├── scripts/                   # check_scripts.sh 脚本静态校验与 verify_m1.sh 多进程黑盒验收脚本
 └── docs/
     ├── ARCHITECTURE.md        # 本架构设计总纲
     ├── adr/                   # ADR 0001 ~ 0008
