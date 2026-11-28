@@ -186,8 +186,8 @@ func (l *fakeLocker) isHeld(taskID uuid.UUID) bool {
 }
 
 type cancelledDelayedCall struct {
-	taskID       uuid.UUID
-	tombstoneTTL time.Duration
+	taskID          uuid.UUID
+	cancelMarkerTTL time.Duration
 }
 
 type fakeDelayedCanceller struct {
@@ -197,13 +197,13 @@ type fakeDelayedCanceller struct {
 	checkLockHeld  func(uuid.UUID) bool
 }
 
-func (c *fakeDelayedCanceller) CancelDelayed(_ context.Context, taskID uuid.UUID, tombstoneTTL time.Duration) error {
+func (c *fakeDelayedCanceller) CancelDelayed(_ context.Context, taskID uuid.UUID, cancelMarkerTTL time.Duration) error {
 	if c.checkLockHeld != nil {
 		c.lockHeldOnCall = c.checkLockHeld(taskID)
 	}
 	c.cancelled = append(c.cancelled, cancelledDelayedCall{
-		taskID:       taskID,
-		tombstoneTTL: tombstoneTTL,
+		taskID:          taskID,
+		cancelMarkerTTL: cancelMarkerTTL,
 	})
 	return c.cancelErr
 }
@@ -501,9 +501,9 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 	if !taskStore.lastCtxHasTask || taskStore.lastCtxTaskID != task.ID {
 		t.Fatalf("expected task_id bound to cancel ctx, has=%v got=%s", taskStore.lastCtxHasTask, taskStore.lastCtxTaskID)
 	}
-	const wantTombstoneTTL = 10 * time.Minute
-	if len(delayed.cancelled) != 1 || delayed.cancelled[0].taskID != task.ID || delayed.cancelled[0].tombstoneTTL != wantTombstoneTTL || !delayed.lockHeldOnCall {
-		t.Fatalf("expected CancelDelayed(%s, %v) while holding lock, got cancelled=%+v lockHeld=%v", task.ID, wantTombstoneTTL, delayed.cancelled, delayed.lockHeldOnCall)
+	const wantCancelMarkerTTL = 10 * time.Minute
+	if len(delayed.cancelled) != 1 || delayed.cancelled[0].taskID != task.ID || delayed.cancelled[0].cancelMarkerTTL != wantCancelMarkerTTL || !delayed.lockHeldOnCall {
+		t.Fatalf("expected CancelDelayed(%s, %v) while holding lock, got cancelled=%+v lockHeld=%v", task.ID, wantCancelMarkerTTL, delayed.cancelled, delayed.lockHeldOnCall)
 	}
 	if locker.releaseCount != 1 || len(locker.held) != 0 {
 		t.Fatalf("expected lock released once, releaseCount=%d held=%d", locker.releaseCount, len(locker.held))
@@ -556,8 +556,8 @@ func TestHandler_CancelTaskLockMutexAndStateGuard(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("expected 200 OK cancelling %s task, got %d: %s", tc.name, rec.Code, rec.Body.String())
 			}
-			if got := delayed.cancelled[len(delayed.cancelled)-1]; got.taskID != targetTask.ID || got.tombstoneTTL != wantTombstoneTTL {
-				t.Fatalf("expected fixed 10m tombstone TTL for %s task, got %+v", tc.name, got)
+			if got := delayed.cancelled[len(delayed.cancelled)-1]; got.taskID != targetTask.ID || got.cancelMarkerTTL != wantCancelMarkerTTL {
+				t.Fatalf("expected fixed 10m cancel marker TTL for %s task, got %+v", tc.name, got)
 			}
 		})
 	}

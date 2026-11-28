@@ -17,7 +17,7 @@ import (
 
 const (
 	// initialExecutionLockTTL 为 Step A 首次抢锁的短租约，仅覆盖读库与前置守卫；
-	// 读到 Endpoint 后再按 timeout_ms + LockGrace 做验主续期，避免短超时任务白占 75s 锁。
+	// 读到 Endpoint 后再核对锁持有人 token 并按 timeout_ms + LockGrace 续期，避免短超时任务白占 75s 锁。
 	initialExecutionLockTTL  = 15 * time.Second
 	defaultLockFallbackDelay = 5 * time.Second
 	lockReleaseTimeout       = 5 * time.Second

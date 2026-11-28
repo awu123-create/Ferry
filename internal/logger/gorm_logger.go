@@ -42,7 +42,7 @@ func (l *GormLogger) Info(ctx context.Context, msg string, data ...any) {
 	if l.level < gormlogger.Info {
 		return
 	}
-	l.log.Info(fmt.Sprintf(msg, data...), contextFields(ctx)...)
+	l.log.Info("gorm info", append(contextFields(ctx), zap.String("detail", fmt.Sprintf(msg, data...)))...)
 }
 
 // Warn 在开启 Warn 级别时输出 GORM 告警日志。
@@ -50,7 +50,7 @@ func (l *GormLogger) Warn(ctx context.Context, msg string, data ...any) {
 	if l.level < gormlogger.Warn {
 		return
 	}
-	l.log.Warn(fmt.Sprintf(msg, data...), contextFields(ctx)...)
+	l.log.Warn("gorm warn", append(contextFields(ctx), zap.String("detail", fmt.Sprintf(msg, data...)))...)
 }
 
 // Error 在开启 Error 级别时输出 GORM 错误日志。
@@ -58,7 +58,7 @@ func (l *GormLogger) Error(ctx context.Context, msg string, data ...any) {
 	if l.level < gormlogger.Error {
 		return
 	}
-	l.log.Error(fmt.Sprintf(msg, data...), contextFields(ctx)...)
+	l.log.Error("gorm error", append(contextFields(ctx), zap.String("detail", fmt.Sprintf(msg, data...)))...)
 }
 
 // Trace 记录 SQL 执行错误（忽略 gorm.ErrRecordNotFound）与超过阈值的慢查询。

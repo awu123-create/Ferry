@@ -28,6 +28,7 @@ linters:
     - depguard
     - usestdlibvars
     - testpackage
+    - thelper
     - forbidigo
   settings:
     usestdlibvars:
@@ -41,6 +42,12 @@ linters:
         - pattern: '^time\.Now$'
           pkg: '^time$'
           msg: "inject now time.Time from caller instead of calling time.Now() directly in internal/domain or internal/infra/pg"
+        - pattern: '^zap\.(S|L|ReplaceGlobals)$'
+          pkg: '^go\.uber\.org/zap$'
+          msg: "inject *zap.Logger and use structured zap.Field instead of global or sugared zap loggers"
+        - pattern: '^zap\.Logger\.Sugar$'
+          pkg: '^go\.uber\.org/zap$'
+          msg: "(*zap.Logger).Sugar is forbidden; use structured zap.Field"
     nolintlint:
       require-explanation: true
       require-specific: true
@@ -321,6 +328,7 @@ linters:
       - path-except: '^internal/(domain|infra/pg)/'
         linters:
           - forbidigo
+        text: 'time\.Now'
 
 issues:
   max-issues-per-linter: 0

@@ -467,7 +467,7 @@ func TestCancelConcurrentWithDelayedProducersZeroResidueIntegration(t *testing.T
 		t.Fatalf("lagged ScheduleDelayed failed: %v", err)
 	}
 	if _, exists := h.delayedScore(gapTask.ID); exists {
-		t.Fatalf("expected cancel tombstone to reject lagged writes into ferry:delayed for task %s", gapTask.ID)
+		t.Fatalf("expected cancel marker to reject lagged writes into ferry:delayed for task %s", gapTask.ID)
 	}
 
 	// 同池放一条比 fallbackDelay 更晚到期的对照任务，启动真实 DelayedForwarder 后一直消费到对照任务到达 Kafka；

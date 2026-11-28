@@ -7,7 +7,7 @@
 
 **Judgement** 标题覆盖其后直到本节末尾的全部条款。**Smell baseline override** 声明本节规则替代的通用代码坏味道基准（供 `/code-review` 与 `.agents/skills/thermo-nuclear-code-quality-review/SKILL.md` 使用），本身不额外新增条款。
 
-本文件的所有条款适用于全仓库任何代码改动；具体技术栈的细则归 `docs/standards/` 下对应文档，不在此重复。
+本文件的所有条款适用于全仓库任何代码改动；通用技术栈细则归 `docs/standards/` 下对应文档，Ferry 项目专属架构契约、历史设计决策与本地开发测试约定分别以 [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)、`docs/adr/` 与 [CONTRIBUTING.md](./CONTRIBUTING.md) 为准。
 
 **Judgement.** 大范围仅用于满足规范的纯重构保持行为等价，单独开 PR 合入，不夹带在业务功能或缺陷修复 PR 中。
 
@@ -76,11 +76,10 @@ Go 实现细节见 [docs/standards/go/code.md](./docs/standards/go/code.md)。
 
 - 领域概念在标识符、文件名、错误文案与日志中一律使用 [GLOSSARY.md](./GLOSSARY.md) 的标准词；使用词汇表 `_Avoid_` 禁用同义词属于违规。
 - 导出标识符结合包名通顺无重复（如 `domain.ErrTaskNotFound`、`pg.Store`、`httpclient.Sender`）。
-- 引用架构决策记录时必须写完整仓库路径（如 `docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md`）或对应的 Markdown 相对链接，不写无路径短号。
 
 **Judgement.**
 
-- 注释写代码本身看不出的信息：并发约束、竞态坑、反直觉取舍或决策 ADR 路径。
+- 注释用日常直白语言写清代码本身看不出的信息（并发约束、竞态风险、反直觉取舍或关联的 `docs/adr/NNNN-*.md` 路径），不用生造缩写与黑话。
 - Issue 与 PR 编号留在 commit 说明和 PR 正文，不写进源码注释，避免合入关闭后失效。
 
 ## 记录同步（Records）

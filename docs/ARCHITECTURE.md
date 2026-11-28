@@ -84,7 +84,7 @@
 |                          ferry-worker (Kafka Consumer)                       | |
 |                                                                              | |
 |  Step A: SET ferry:lock:task:<id> <token> NX PX 抢执行锁                      | |
-|          (争用时先查 PG 终态，未终态经 Lua 校验取消墓碑后写保底唤醒点再 Ack)    | |
+|          (争用时先查 PG 终态，未终态经 Lua 校验取消标记后写保底唤醒点再 Ack)    | |
 |  Step B: 查 PG tasks + 3s 短缓存 Endpoint；早到拦截(预约/退避严格 now<next,   | |
 |          立即保留 1s 容差) -> 覆写延迟池并清租约 -> 单 defer 放锁再 Ack；      | |
 |          若已终态放锁确认；若禁用或超 deadline_at -> 乐观锁 CAS 转 DLQ         | |
@@ -157,7 +157,7 @@
 
 ## 五、目标数据库表结构设计（PostgreSQL 16）
 
-全系统目标数据模型收敛为 **4 张核心表**（以下为完整架构契约；遵循 [docs/standards/database.md](./standards/database.md) 的调用方原则，各表、列与部分索引通过 `migrations/NNNN_*.sql` 随对应 Milestone 的生产代码按需增量落地，当前 `main` 分支尚未落盘迁移脚本）：
+全系统目标数据模型收敛为 **4 张核心表**（以下为完整目标架构契约；遵循 [docs/standards/database.md](./standards/database.md) 的调用方原则，4 张基础表、幂等唯一约束、`outbox` 索引与触发器已由 `migrations/0001_init.sql` 落地，`tasks_reconcile_idx` 与 `tasks_dlq_idx` 等部分索引随对应 Milestone 的生产查询按需增量迁移引入）：
 
 ```sql
 CREATE TABLE endpoints (
@@ -260,7 +260,7 @@ CREATE TRIGGER outbox_notify_trg
 | **1. PG 写完任务与 Outbox，未推 Kafka 前 API/Relay 宕机** | 任务已返回 `202 Accepted`，但 Kafka `ferry.tasks.ready` 无消息 | `outbox` 行与 `tasks` 行在同一 PG 事务提交；任意存活或重启后的 `ferry-server` Relay 协程通过 `500ms` 兜底定时器执行 `FOR UPDATE SKIP LOCKED`（绑 `5s` 硬超时）捞起该记录推入 Kafka 并物理删除 `outbox` |
 | **2. Redis 不可用（分两阶段）** | ① **断连拒绝服务期间**：无法读/写熔断、限流、信号量与 `ferry:delayed`；<br>② **宕机重启内存清空后**：ZSet 倒计时任务全部蒸发 | ① **断连期间双通道隔离与 Fail-Safe**：入口 `POST /v1/tasks` 只依赖 PG 照常接单；Outbox 立即通道（`deliver_at <= now()`）完全不碰 Redis 照常直推 Kafka，延迟通道独立退避不堵队头；Worker 检测到连续 Redis 失败立即**暂停拉取 Kafka** 并让出 `/readyz`；<br>② **清空恢复后自愈**：`60s` PG Reconciler 游标循环扫完 `next_run_at < now()-60s` 且不在 Redis 中的在途任务，通过 `ZADD NX` 批量回灌延迟池恢复转发，做到**零丢单** |
 | **3. 下游持续超时（10s）或 5xx 风暴** | 单慢接口占满全局 HTTP 协程或制造空转风暴（Noisy Neighbor） | 1. 前 `max_concurrency` 个在途请求触发超时，连续可重试失败达 `circuit_threshold`（默认 `30`）后 `ferry:cb:<ep>` 切为 `OPEN 30s`（收到 `429 Retry-After` 同样推迟 Endpoint 冷却窗口）；<br>2. 后续到达的同 Endpoint 任务在 `admit_endpoint.lua` 微秒级被拒，不增 `attempt`，按 `1/rate_limit_qps` 虚拟排号游标 `next_free_ms` 均匀摊开写回 `ferry:delayed`，既释放 Worker 协程又消除高频空转；<br>3. 冷却后放行 **1 个带过期保护**的 `HALF_OPEN` 试探请求，通则恢复 `CLOSED`，不通继续 `OPEN`；超 `max_attempts` 或 `deadline_at` 安全落入 `DEAD_LETTER`，恢复后经 `POST /v1/dlq/replay` 平滑重放 |
-| **4. Worker 收到 `SIGTERM` 优雅停机** | 在途 HTTP 请求被腰斩、已发完的 Offset 未提交、未发完的却先提交了 Offset | 1. 收到 `SIGTERM` 立即将 `/readyz` 置为 `503`（通知外部摘流）并停止从 Kafka `Poll` 新消息；<br>2. 等待 `WaitGroup` 排空所有正在执行 HTTP 请求的协程（设置 `25s` 优雅上限），让其完整写完 `task_attempts` 与 `tasks` 状态，调用 `CompleteDelivery` 归还并发槽位并验主释放执行锁；<br>3. 仅提交已完整处理的连续 Kafka Offset 后关闭连接退出；<br>4. 若超过 `25s` 仍未排空被迫退出，未提交 Offset 的消息在 Kafka Rebalance 后重发，且旧槽位将在 `timeout_ms + 5s` 自动过期释放 |
+| **4. Worker 收到 `SIGTERM` 优雅停机** | 在途 HTTP 请求被腰斩、已发完的 Offset 未提交、未发完的却先提交了 Offset | 1. 收到 `SIGTERM` 立即将 `/readyz` 置为 `503`（通知外部摘流）并停止从 Kafka `Poll` 新消息；<br>2. 等待 `WaitGroup` 排空所有正在执行 HTTP 请求的协程（设置 `25s` 优雅上限），让其完整写完 `task_attempts` 与 `tasks` 状态，调用 `CompleteDelivery` 归还并发槽位并核对持有人 token 释放执行锁；<br>3. 仅提交已完整处理的连续 Kafka Offset 后关闭连接退出；<br>4. 若超过 `25s` 仍未排空被迫退出，未提交 Offset 的消息在 Kafka Rebalance 后重发，且旧槽位将在 `timeout_ms + 5s` 自动过期释放 |
 | **5. Worker 执行中遭遇 `kill -9` / OOM 强杀** | 未能执行清理并发槽位与删锁逻辑，且重平衡消息可能撞上未过期旧锁 | `ferry:inflight:<ep>` 槽位与 `HALF_OPEN` 试探名额均携带到期时间戳自动失效回收；新 Worker 收到重平衡消息若遇旧 `Execution Lock` 尚未过期，先查 PG 排除终态，活跃态再通过原子 Lua 校验取消标记后在延迟池写入保底唤醒点（若池中仅剩 Forwarder 临时租约则覆盖并删掉租约记录）再确认 Offset，锁过期后立即无缝续接，**绝不死锁或漏单** |
 | **6. 下游已业务处理成功，但回传 `200 OK` 时断网** | Ferry 判定网络超时并按退避规则重新投递 | 遵循网络投递“至少一次”客观定理，每次投递强制携带同一 `X-Ferry-Task-ID` 与 `X-Ferry-Signature`，下游以 `X-Ferry-Task-ID` 为幂等键去重，保证业务结果“精确一次” |
 
@@ -301,10 +301,12 @@ CREATE TRIGGER outbox_notify_trg
 
 ### 7.3 工程化质量门禁
 
-- **`Makefile`**：统一封装 `setup-hooks`、`fmt`、`fmt-check`、`check-adr`、`check-scripts`、`lint`、`test`（`-short` 无容器快测）、`test-integration`（全量真容器测试）、`up`、`down`、`migrate`、`verify-m1` 与 `build`；
-- **`.golangci.yml`（v2）**：强制开启 `govet`、`staticcheck`、`errcheck`、`errorlint`、`bodyclose`、`noctx`、`copyloopvar`、`durationcheck`、`gocritic`、`nolintlint`、`usestdlibvars`、`testpackage`、`forbidigo`（禁止 `internal/{domain,infra/pg}` 生产代码裸调 `time.Now`）与 `depguard`（包含全局 `json_v2` 规则禁止旧 `encoding/json`，并对 `domain` 与 `{api,scheduler,worker}` 启用 `strict` 白名单门禁，锁死零跨层越界依赖）；
-- **`.pre-commit-config.yaml`**：基础文本/YAML/私钥检查、系统 `shellcheck` 与 `bash -n` 脚本校验、`adr-number-unique`（校验 `docs/adr/NNNN-*.md` 编号唯一）、`gofmt`、监听 `.golangci.yml` 的全量 `make lint`、`golangci-lint` 增量扫描与 `go test -short ./...`；
-- **GitHub Actions CI（`.github/workflows/ci.yml`）**：并行运行 `verify`（复用 `Makefile` 执行格式、ADR 编号、脚本 `shellcheck`、全量 lint、竞态短单测与二进制构建）与 `integration`（拉起 `deploy/docker-compose.yml` 真实 PG/Kafka/Redis 容器依次执行 `make test-integration` 与 `timeout 120 env SKIP_TESTS=1 make verify-m1`），与仓库 `Protect main` 规则集保持一致。
+具体启用规则与钩子列表直接以配置文件为唯一真相源（本地安装与校验流程见 [CONTRIBUTING.md](../CONTRIBUTING.md)）：
+
+- **[Makefile](../Makefile)**：统一封装本地工具安装、代码格式、ADR 引用门禁、脚本校验、静态检查、短单测、真容器集成测试、容器编排、数据库迁移与黑盒验收入口；
+- **[.golangci.yml](../.golangci.yml)（v2）**：强制执行跨包分层白名单（`depguard`）、Go 1.27 `encoding/json/v2`、黑盒测试包名、测试辅助函数规范与时间注入约束；
+- **[.pre-commit-config.yaml](../.pre-commit-config.yaml)**：串联基础文件卫生、系统 `shellcheck` 与 `bash -n` 脚本检查、ADR 编号与完整路径校验、`gofmt`、静态检查与短单测；
+- **[.github/workflows/ci.yml](../.github/workflows/ci.yml)**：并行运行 `verify`（格式、ADR 门禁、脚本、全量 lint、竞态短单测与构建）与 `integration`（真实 PG/Kafka/Redis 容器集成测试与 Milestone 1 黑盒验收），与仓库 `Protect main` 规则集一致。
 
 ---
 
@@ -317,13 +319,14 @@ Ferry/
 ├── .env.example               # 与 internal/config/config.go 对齐的环境变量示例
 ├── AGENTS.md                  # 场景路由入口（指向协作与分层编码规范）
 ├── CODING_STANDARDS.md        # 跨语言编码基线（Hard / Judgement / Smell baseline override）
+├── CONTRIBUTING.md            # 本地工具安装、测试分层归属、真容器隔离与项目编码约定
 ├── GLOSSARY.md                # 统一语言词表（单一限界上下文，零基础设施实现泄漏）
 ├── Makefile                   # 开发、容器编排、集成测试与黑盒验收入口
-├── README.md                  # 项目概览与快速校验说明
+├── README.md                  # 项目概览与快速启动说明
 ├── go.mod                     # Go 1.27 模块定义
 ├── .github/                   # GitHub Actions CI (ci.yml) 与 PR 模板 (pull_request_template.md)
-├── .golangci.yml              # golangci-lint v2 静态检查、depguard 分层、json_v2、usestdlibvars、testpackage 与 forbidigo 门禁
-├── .pre-commit-config.yaml    # 本地提交钩子（基础检查、shellcheck/bash-n、ADR 编号、gofmt、配置全量 lint、增量 lint、短单测）
+├── .golangci.yml              # golangci-lint v2 静态检查与 depguard 分层门禁配置
+├── .pre-commit-config.yaml    # 本地提交钩子配置
 ├── cmd/                       # 入口组装根（ferry-server / ferry-worker / chaos-receiver 已实现，ferry-bench 留待 M3）
 ├── internal/
 │   ├── domain/                # 纯 Go 领域核（endpoint / task / delivery / errors）
@@ -360,6 +363,7 @@ Milestone 1 ~ 4 的切片边界、服务端口矩阵、目标模块目录规划�
 
 ## 九、规范、词表与架构决策索引（Standards, Glossary & ADRs）
 
+- [开发与贡献指南（`CONTRIBUTING.md`）](../CONTRIBUTING.md)
 - [全局编码规范（`CODING_STANDARDS.md`）](../CODING_STANDARDS.md)
 - [Go 代码规范（`docs/standards/go/code.md`）](./standards/go/code.md)
 - [Go 测试规范（`docs/standards/go/testing.md`）](./standards/go/testing.md)

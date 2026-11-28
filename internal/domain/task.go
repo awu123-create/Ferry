@@ -222,7 +222,7 @@ func NewTask(params NewTaskParams) (Task, error) {
 
 // VerifyIdempotentReplay 校验重复提交的请求是否与已持久化 Task 的幂等快照一致。
 //
-// 契约要求（ADR-0004 & ADR-0008）：
+// 契约要求（见 docs/adr/0004-endpoint-flow-control-and-three-layer-idempotency.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）：
 //   - 校验 EndpointID 与 IdempotencyKey 匹配，并同时比对 PayloadSHA256 与自定义 Headers。
 //   - 完全一致时返回 nil（调用方返回 200 OK 与原 Task）。
 //   - PayloadSHA256 或 Headers 不一致时返回 ErrIdempotencyConflict（调用方返回 409 Conflict）。
@@ -271,7 +271,7 @@ func (t Task) isEarlyArrival(now time.Time) bool {
 
 // RecordOutcome 对出站 DeliveryResult 进行分级，演进 Task 状态并生成只追加 DeliveryAttempt 记录。
 //
-// 契约要求（ADR-0005、ADR-0007 & ADR-0008）：
+// 契约要求（见 docs/adr/0005-state-machine-dlq-replay-and-observability-boundary.md、docs/adr/0007-tactical-ddd-and-deep-module-seams.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）：
 //   - 要求 t.Status.IsActive()（否则返回 ErrValidation）。
 //   - 递增 Attempt（attemptNo = t.Attempt + 1）并构造包含 TaskID、ReplayCount、AttemptNo 等字段的 DeliveryAttempt。
 //   - HTTP 2xx：迁移至 SUCCEEDED，设置 CompletedAt = &now，CircuitSuccess = true。
@@ -345,7 +345,7 @@ func (t *Task) RecordOutcome(result DeliveryResult, now time.Time) (OutcomeTrans
 
 // Cancel 将处于非终态（PENDING 或 RETRYING）的 Task 迁移为 CANCELLED。
 //
-// 契约要求（ADR-0007 & ADR-0008）：
+// 契约要求（见 docs/adr/0007-tactical-ddd-and-deep-module-seams.md 与 docs/adr/0008-concurrency-fencing-and-flow-control-hardening.md）：
 //   - 若 t.Status.IsTerminal()：返回 ErrTaskNotCancellable。
 //   - 设置 Status = TaskStatusCancelled、CompletedAt = &now、UpdatedAt = now.UTC()。
 func (t *Task) Cancel(now time.Time) error {

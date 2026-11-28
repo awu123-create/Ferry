@@ -34,8 +34,8 @@ var (
 		local written = 0
 		for i = 2, #ARGV, 2 do
 			local member = ARGV[i + 1]
-			local tombstone_key = KEYS[2 + (i / 2)]
-			if redis.call("EXISTS", tombstone_key) == 1 then
+			local cancel_marker_key = KEYS[2 + (i / 2)]
+			if redis.call("EXISTS", cancel_marker_key) == 1 then
 				redis.call("ZREM", KEYS[1], member)
 				redis.call("HDEL", KEYS[2], member)
 			else
@@ -181,14 +181,14 @@ func (c *Client) ScheduleDelayed(ctx context.Context, taskID uuid.UUID, runAt ti
 }
 
 // CancelDelayed 为已取消任务写入带过期时间的取消标记，并一次性从延迟池和租约表里删掉它，防止后续迟到的写回把任务重新塞进延迟池。
-func (c *Client) CancelDelayed(ctx context.Context, taskID uuid.UUID, tombstoneTTL time.Duration) error {
+func (c *Client) CancelDelayed(ctx context.Context, taskID uuid.UUID, cancelMarkerTTL time.Duration) error {
 	if taskID == uuid.Nil {
 		return fmt.Errorf("cancel delayed task: task id must not be empty")
 	}
-	if tombstoneTTL <= 0 {
-		return fmt.Errorf("cancel delayed task: tombstone ttl must be > 0")
+	if cancelMarkerTTL <= 0 {
+		return fmt.Errorf("cancel delayed task: cancel marker ttl must be > 0")
 	}
-	ttlMs := ceilDurationMillis(tombstoneTTL)
+	ttlMs := ceilDurationMillis(cancelMarkerTTL)
 	keys := []string{delayedQueueKey, delayedLeaseKey, cancelledDelayedKey(taskID)}
 	if err := cancelDelayedScript.Run(ctx, c.rdb, keys, taskID.String(), ttlMs).Err(); err != nil {
 		return fmt.Errorf("cancel delayed task: %w", err)
