@@ -14,12 +14,6 @@ repos:
       - id: check-added-large-files
       - id: detect-private-key
 
-  - repo: https://github.com/shellcheck-py/shellcheck-py
-    rev: v0.11.0.1
-    hooks:
-      - id: shellcheck
-        types: [shell]
-
   - repo: local
     hooks:
       - id: adr-number-unique
@@ -29,14 +23,10 @@ repos:
         files: ^docs/adr/[0-9].*\.md$
         pass_filenames: false
 
-      - id: ferry-bash-syntax
-        name: bash syntax check (bash -n)
+      - id: ferry-shell-scripts
+        name: shell script check (bash -n & shellcheck)
         language: system
-        entry: >-
-          bash -c 'set -euo pipefail;
-          for f in "$@"; do
-          bash -n "$f";
-          done' --
+        entry: scripts/check_scripts.sh
         types: [shell]
 
       - id: ferry-gofmt

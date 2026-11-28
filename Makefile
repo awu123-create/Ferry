@@ -3,6 +3,7 @@ SHELL := /usr/bin/env bash
 .PHONY: setup-hooks fmt fmt-check check-adr check-scripts lint test test-integration build up down migrate verify-m1
 
 GOLANGCI_LINT ?= golangci-lint
+SHELLCHECK ?= shellcheck
 BUILD_DIR ?= .build
 COMPOSE_FILE ?= deploy/docker-compose.yml
 
@@ -29,23 +30,7 @@ check-adr:
 	fi
 
 check-scripts:
-	@set -euo pipefail; \
-	shopt -s nullglob; \
-	scripts=(scripts/*.sh); \
-	if [ "$${#scripts[@]}" -eq 0 ]; then \
-		exit 0; \
-	fi; \
-	for s in "$${scripts[@]}"; do \
-		bash -n "$$s"; \
-	done; \
-	if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck "$${scripts[@]}"; \
-	elif [ "$${REQUIRE_SHELLCHECK:-0}" = "1" ]; then \
-		echo "shellcheck is required when REQUIRE_SHELLCHECK=1" >&2; \
-		exit 1; \
-	else \
-		echo "shellcheck not installed locally; ran bash -n only (use pre-commit or REQUIRE_SHELLCHECK=1 for full lint)" >&2; \
-	fi
+	SHELLCHECK="$(SHELLCHECK)" ./scripts/check_scripts.sh
 
 lint:
 	$(GOLANGCI_LINT) config verify

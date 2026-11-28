@@ -31,7 +31,8 @@ jobs:
         run: |
           make fmt-check
           make check-adr
-          REQUIRE_SHELLCHECK=1 make check-scripts
+          shellcheck --version
+          make check-scripts
 
       - name: Install and run golangci-lint
         run: |

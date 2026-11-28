@@ -118,7 +118,7 @@ Ferry/
 ├── migrations/                  # Goose SQL 迁移脚本与 embed.go
 ├── tests/integration/           # 真实 PG + Kafka + Redis 端到端集成测试
 ├── deploy/                      # docker-compose.yml（PostgreSQL 16 / Kafka 3.9 KRaft / Redis 7.4）
-├── scripts/                     # verify_m1.sh 多进程黑盒验收脚本
+├── scripts/                     # Shell 脚本校验（check_scripts.sh）与 M1 多进程黑盒验收脚本（verify_m1.sh）
 └── docs/
     ├── ARCHITECTURE.md          # 架构设计总纲
     ├── adr/                     # ADR 0001 ~ 0008
@@ -129,7 +129,7 @@ Ferry/
 
 ### 快速校验与本地运行
 
-前置要求：本机已安装 Go 1.27、Docker Compose、[`golangci-lint v2`](https://golangci-lint.run/) 与 [`pre-commit`](https://pre-commit.com/)。
+前置要求：本机已安装 Go 1.27、Docker Compose、[`golangci-lint v2`](https://golangci-lint.run/)、[`shellcheck`](https://www.shellcheck.net/)（macOS 可执行 `brew install shellcheck`）与 [`pre-commit`](https://pre-commit.com/)。
 
 ```bash
 # 1. 安装 Git pre-commit 钩子（首次拉取仓库后执行）
